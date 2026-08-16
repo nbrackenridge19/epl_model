@@ -52,6 +52,12 @@ DRY_RUN = True
 S = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
 
+# Same reasoning as the odds scraper: ESPN blocks GitHub Actions' runner
+# IPs specifically, confirmed via real 403s. Proxy only when available
+# (GitHub Actions), unproxied locally (already confirmed working).
+_proxy_url = os.environ.get("SCRAPERAPI_PROXY_URL")
+PROXIES = {"http": _proxy_url, "https": _proxy_url} if _proxy_url else None
+
 # Same authoritative mapping as the odds scraper (from epl_team_codes.xlsx),
 # plus the 2026-27 promoted teams.
 ESPN_NAME_TO_CODE = {
@@ -73,7 +79,7 @@ def daterange(start, end):
 
 
 def fetch_json(url, params=None, timeout=20):
-    r = S.get(url, params=params, timeout=timeout)
+    r = S.get(url, params=params, proxies=PROXIES, timeout=timeout, verify=(PROXIES is None))
     r.raise_for_status()
     return r.json()
 
@@ -191,8 +197,7 @@ if __name__ == "__main__":
             continue
 
         games = parse_games_from_scoreboard(sb)
-        if games:
-            print(f"{d}: {len(games)} game(s) found", flush=True)
+        print(f"{d}: {len(games)} game(s) found", flush=True)
         for g in games:
             with engine.begin() as conn:
                 try:

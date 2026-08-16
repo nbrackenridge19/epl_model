@@ -55,6 +55,15 @@ REQUEST_SLEEP_SECONDS = 0.5  # ESPN's public API is more permissive than FBref, 
 S = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
 
+# ESPN's API blocks GitHub Actions' runner IPs (confirmed via real 403s
+# in production, even though the exact same requests work fine from a
+# regular machine) -- route through the same ScraperAPI proxy already
+# used for FBref, but only when that credential is actually available
+# (i.e. on GitHub Actions). Local runs continue unproxied, matching
+# already-confirmed working behavior.
+_proxy_url = os.environ.get("SCRAPERAPI_PROXY_URL")
+PROXIES = {"http": _proxy_url, "https": _proxy_url} if _proxy_url else None
+
 # Authoritative ESPN displayName -> team code, from the user's own
 # epl_team_codes.xlsx (not guessed).
 ESPN_NAME_TO_CODE = {
@@ -78,7 +87,7 @@ def daterange(start, end):
 
 
 def fetch_json(url, params=None, timeout=20):
-    r = S.get(url, params=params, timeout=timeout)
+    r = S.get(url, params=params, proxies=PROXIES, timeout=timeout, verify=(PROXIES is None))
     r.raise_for_status()
     return r.json()
 
