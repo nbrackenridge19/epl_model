@@ -227,33 +227,43 @@ def parse_lineup_section(soup, team_index):
     """FBref's 'Lineups' box is a <table>, not a <ul> as originally
     assumed -- confirmed via real HTML. Each row is <td>number</td>
     <td><a>Player Name</a>...</td>; a <th colspan="2"> row marks either
-    the team/formation header or the literal text "Bench", which is the
-    starter/bench divider. Rows before "Bench" = starters, after = bench
-    -- confirmed this is correct regardless of substitute_in/out icons
-    present on names in either section (those icons describe subsequent
-    match events, not initial starter/bench status)."""
+    the team/formation header (e.g. "Liverpool (4-2-3-1)") or the
+    literal text "Bench", which is the starter/bench divider. Rows
+    before "Bench" = starters, after = bench -- confirmed this is
+    correct regardless of substitute_in/out icons present on names in
+    either section (those icons describe subsequent match events, not
+    initial starter/bench status).
+    Returns (starters, bench, formation) -- formation is None if the
+    header text doesn't match the expected "(X-X-X)" pattern."""
     lineup_divs = soup.find_all("div", class_="lineup")
     if len(lineup_divs) < 2:
-        return None, None
+        return None, None, None
     div = lineup_divs[team_index]
     table = div.find("table")
     if table is None:
-        return None, None
+        return None, None, None
 
     starters, bench = [], []
     in_bench_section = False
+    formation = None
     for tr in table.find_all("tr"):
         th = tr.find("th")
         if th is not None:
-            if "bench" in th.get_text(strip=True).lower():
+            th_text = th.get_text(strip=True)
+            if "bench" in th_text.lower():
                 in_bench_section = True
-            continue  # header row (team/formation name, or "Bench") -- not a player
+            elif formation is None:
+                # first non-"Bench" header row is the team/formation line
+                m = re.search(r"\(([\d\-]+)\)\s*$", th_text)
+                if m:
+                    formation = m.group(1)
+            continue  # header row -- not a player
         link = tr.find("a")
         if link is None:
             continue
         name = link.get_text(strip=True)
         (bench if in_bench_section else starters).append(name)
-    return starters, bench
+    return starters, bench, formation
 
 
 def discover_all_fixtures():
@@ -387,8 +397,8 @@ def scrape_match_report(url):
     home_stats = parse_player_stats_table(soup, 0)
     away_stats = parse_player_stats_table(soup, 1)
 
-    home_starters, home_bench = parse_lineup_section(soup, 0)
-    away_starters, away_bench = parse_lineup_section(soup, 1)
+    home_starters, home_bench, home_formation = parse_lineup_section(soup, 0)
+    away_starters, away_bench, away_formation = parse_lineup_section(soup, 1)
 
     if home_starters is None or away_starters is None:
         # lineup section not found -- fall back to the old (imprecise)
@@ -408,6 +418,8 @@ def scrape_match_report(url):
         "away_goals": away_goals,
         "home_players": home_records,
         "away_players": away_records,
+        "home_formation": home_formation,
+        "away_formation": away_formation,
     }
 
 
@@ -442,19 +454,23 @@ def process_match(conn, teams, matches, report):
 
     conn.execute(
         text("""
-            insert into match_team_stats (match_id, team_id, is_home, goals_for, goals_against)
-            values (:match_id, :team_id, true, :gf, :ga)
-            on conflict (match_id, team_id) do update set goals_for = excluded.goals_for, goals_against = excluded.goals_against
+            insert into match_team_stats (match_id, team_id, is_home, goals_for, goals_against, formation)
+            values (:match_id, :team_id, true, :gf, :ga, :formation)
+            on conflict (match_id, team_id) do update
+                set goals_for = excluded.goals_for, goals_against = excluded.goals_against, formation = excluded.formation
         """),
-        {"match_id": match_id, "team_id": home_id, "gf": data["home_goals"], "ga": data["away_goals"]},
+        {"match_id": match_id, "team_id": home_id, "gf": data["home_goals"], "ga": data["away_goals"],
+         "formation": data.get("home_formation")},
     )
     conn.execute(
         text("""
-            insert into match_team_stats (match_id, team_id, is_home, goals_for, goals_against)
-            values (:match_id, :team_id, false, :gf, :ga)
-            on conflict (match_id, team_id) do update set goals_for = excluded.goals_for, goals_against = excluded.goals_against
+            insert into match_team_stats (match_id, team_id, is_home, goals_for, goals_against, formation)
+            values (:match_id, :team_id, false, :gf, :ga, :formation)
+            on conflict (match_id, team_id) do update
+                set goals_for = excluded.goals_for, goals_against = excluded.goals_against, formation = excluded.formation
         """),
-        {"match_id": match_id, "team_id": away_id, "gf": data["away_goals"], "ga": data["home_goals"]},
+        {"match_id": match_id, "team_id": away_id, "gf": data["away_goals"], "ga": data["home_goals"],
+         "formation": data.get("away_formation")},
     )
 
     conn.execute(text("update matches set home_goals = :hg, away_goals = :ag, status = 'completed' where id = :id"),
