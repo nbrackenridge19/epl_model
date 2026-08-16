@@ -169,10 +169,31 @@ def process_game(conn, teams, matches, game):
     for team_roster in rosters:
         home_away = team_roster.get("homeAway")
         team_id = home_id if home_away == "home" else away_id
+        is_home = home_away == "home"
         roster = team_roster.get("roster")
+        formation = team_roster.get("formation")
+
         if not roster:
             print(f"  {game['home_team']} vs {game['away_team']}: no lineup posted yet for {home_away} side", flush=True)
             continue
+
+        if formation and not DRY_RUN:
+            # Expected formation from ESPN, pre-match. Written to the SAME
+            # column FBref's scraper updates the next morning with the
+            # real, confirmed formation -- the temporal handoff (this
+            # only ever runs same-day, FBref only runs the day after)
+            # means FBref's value can never get overwritten by this once
+            # it lands; this is purely a same-day placeholder until then.
+            conn.execute(
+                text("""
+                    insert into match_team_stats (match_id, team_id, is_home, formation)
+                    values (:match_id, :team_id, :is_home, :formation)
+                    on conflict (match_id, team_id) do update set formation = excluded.formation
+                """),
+                {"match_id": match_id, "team_id": team_id, "is_home": is_home, "formation": formation},
+            )
+        elif formation and DRY_RUN:
+            print(f"  [DRY RUN] would write expected formation: {home_away} = {formation}", flush=True)
 
         for p in roster:
             name = (p.get("athlete") or {}).get("fullName")
