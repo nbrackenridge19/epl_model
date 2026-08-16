@@ -27,4 +27,5 @@ jobs:
       - name: Run lineup poller
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
         run: python scripts/poll_espn_lineups.py

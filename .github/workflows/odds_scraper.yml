@@ -24,4 +24,5 @@ jobs:
       - name: Run odds scraper
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
         run: python scripts/scrape_espn_odds.py
