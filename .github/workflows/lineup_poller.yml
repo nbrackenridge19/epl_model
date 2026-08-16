@@ -1,14 +1,14 @@
 name: ESPN lineup poller
 
-# Runs every 10 minutes, but only during hours PL matches realistically
-# kick off (10:00-22:00 UTC covers early Saturday kickoffs through late
-# weeknight ones) -- avoids burning Actions minutes overnight for no
-# reason. The script itself is cheap to run when nothing's happening
-# (just checks the scoreboard, finds nothing, exits), so this doesn't
-# need to be smarter than a flat schedule.
+# Runs every 10 minutes, but only 7am-4pm Eastern (11:00-21:00 UTC covers
+# both EDT and EST, since the season spans the DST boundary) -- matches
+# don't kick off outside this window. Also has a free, no-credit-cost
+# gameday check inside the script itself (queries our own already-synced
+# fixture list) that skips the run entirely with zero ScraperAPI usage
+# on days with no matches at all.
 on:
   schedule:
-    - cron: "*/10 10-22 * * *"
+    - cron: "*/10 11-21 * * *"
   workflow_dispatch: {}
 
 jobs:

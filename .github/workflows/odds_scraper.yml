@@ -1,28 +1,52 @@
 name: ESPN odds scraper
 
-# ESPN's API is live/current, not next-day-only like FBref -- runs a few
-# times a day to catch odds as they get posted and track any movement.
-# No ScraperAPI credentials needed here, just DATABASE_URL.
+# Split into two schedules to avoid re-scanning a full week's worth of
+# fixtures on every run:
+#   - "frequent": today only, every 15 min during matchday hours --
+#     catches the closing-line window for whatever's kicking off soon.
+#   - "daily-wide": once a day, scans the full week ahead -- discovers
+#     new matches as they enter the window and captures their opening
+#     snapshot (the script's own "first time seeing this match" logic
+#     handles that automatically).
 on:
   schedule:
-    - cron: "0 9,15,21 * * *"   # 9am, 3pm, 9pm UTC
+    - cron: "*/15 11-21 * * *"   # frequent, narrow -- 7am-4pm Eastern (covers both EDT/EST)
+    - cron: "30 7 * * *"          # daily, wide
   workflow_dispatch: {}
 
 jobs:
-  scrape:
+  frequent:
+    if: github.event.schedule == '*/15 11-21 * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: pip install requests sqlalchemy psycopg2-binary
-
-      - name: Run odds scraper
+      - name: Run odds scraper (today only)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
+          ODDS_DAYS_BACK: "0"
+          ODDS_DAYS_FORWARD: "0"
+        run: python scripts/scrape_espn_odds.py
+
+  daily_wide:
+    if: github.event.schedule == '30 7 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install requests sqlalchemy psycopg2-binary
+      - name: Run odds scraper (full week ahead)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
+          ODDS_DAYS_BACK: "2"
+          ODDS_DAYS_FORWARD: "7"
         run: python scripts/scrape_espn_odds.py
