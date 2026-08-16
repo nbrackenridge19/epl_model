@@ -1,0 +1,30 @@
+name: ESPN lineup poller
+
+# Runs every 10 minutes, but only during hours PL matches realistically
+# kick off (10:00-22:00 UTC covers early Saturday kickoffs through late
+# weeknight ones) -- avoids burning Actions minutes overnight for no
+# reason. The script itself is cheap to run when nothing's happening
+# (just checks the scoreboard, finds nothing, exits), so this doesn't
+# need to be smarter than a flat schedule.
+on:
+  schedule:
+    - cron: "*/10 10-22 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests sqlalchemy psycopg2-binary
+
+      - name: Run lineup poller
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/poll_espn_lineups.py

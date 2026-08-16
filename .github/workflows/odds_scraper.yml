@@ -1,0 +1,27 @@
+name: ESPN odds scraper
+
+# ESPN's API is live/current, not next-day-only like FBref -- runs a few
+# times a day to catch odds as they get posted and track any movement.
+# No ScraperAPI credentials needed here, just DATABASE_URL.
+on:
+  schedule:
+    - cron: "0 9,15,21 * * *"   # 9am, 3pm, 9pm UTC
+  workflow_dispatch: {}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests sqlalchemy psycopg2-binary
+
+      - name: Run odds scraper
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/scrape_espn_odds.py

@@ -1,0 +1,29 @@
+name: FBref match scraper
+
+# FBref doesn't publish match reports until the morning after -- this
+# runs once daily, mid-morning UK time, to catch anything from the
+# previous day(s) of matches. cron times are always UTC; 8:00 UTC is
+# roughly 8-9am UK time depending on daylight saving.
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml sqlalchemy psycopg2-binary
+
+      - name: Run FBref scraper
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
+        run: python scripts/scrape_fbref_matches.py
