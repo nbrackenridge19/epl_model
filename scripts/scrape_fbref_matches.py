@@ -295,11 +295,16 @@ def discover_all_fixtures():
 
 def sync_fixtures(conn, teams, season):
     """Ensures every fixture for the season has a matches row, even
-    before it's played. Run this once early (e.g. before the season
-    starts, or as the first step of a live run) -- cheap to re-run,
-    on conflict do nothing means it only fills in what's missing."""
+    before it's played. Also keeps match_date/matchweek current for
+    still-unplayed fixtures -- the Premier League only confirms exact
+    dates/times on a rolling basis (early season fixtures are initially
+    just placeholder dates, e.g. 'Saturday of the matchweek', and get
+    officially fixed closer to the time). The WHERE clause on the update
+    restricts this to status='scheduled' rows only, so an already-played
+    match's real result can never get overwritten by a stale date."""
     fixtures = discover_all_fixtures()
     created = 0
+    updated = 0
     for f in fixtures:
         home_code = TEAM_NAME_TO_CODE.get(f["home"])
         away_code = TEAM_NAME_TO_CODE.get(f["away"])
@@ -322,15 +327,21 @@ def sync_fixtures(conn, teams, season):
             text("""
                 insert into matches (season, matchweek, match_date, home_team_id, away_team_id, status, source_lgame)
                 values (:season, :wk, :date, :home_id, :away_id, 'scheduled', :lgame)
-                on conflict (season, home_team_id, away_team_id) do nothing
-                returning id
+                on conflict (season, home_team_id, away_team_id) do update
+                    set match_date = excluded.match_date, matchweek = excluded.matchweek
+                    where matches.status = 'scheduled' and matches.match_date is distinct from excluded.match_date
+                returning id, (xmax = 0) as was_insert
             """),
             {"season": season, "wk": safe_int(f["matchweek"]), "date": match_date,
              "home_id": home_id, "away_id": away_id, "lgame": synthetic_lgame},
         ).fetchone()
         if result is not None:
-            created += 1
-    print(f"  fixture sync: {created} new matches rows created, {len(fixtures)} total fixtures found", flush=True)
+            if result[1]:  # was_insert
+                created += 1
+            else:
+                updated += 1
+    print(f"  fixture sync: {created} new matches rows created, {updated} dates updated, "
+          f"{len(fixtures)} total fixtures found", flush=True)
 
 
 def safe_int(value):

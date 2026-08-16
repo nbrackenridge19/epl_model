@@ -29,9 +29,11 @@ Set DATABASE_URL the same way as the other migration scripts.
 
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -44,8 +46,20 @@ SEASON = 2627  # matches this database's season-numbering convention
 # (line movement) and catches anything just finished. For a first TEST,
 # set DAYS_BACK/DAYS_FORWARD to bracket a date you know has real fixtures
 # (e.g. opening weekend) rather than relying on "today" alone.
-DAYS_BACK = 2
-DAYS_FORWARD = 7
+# Overridable via environment variable so the SAME script can run in two
+# modes from two different GitHub Actions schedules: a frequent, narrow
+# scan (today only, for closing-line capture) and a much less frequent,
+# wide scan (the full week ahead, for discovering new matches and their
+# opening snapshot). Running the wide window frequently was pure waste --
+# matches 5-7 days out can never be in the closing window yet anyway, so
+# scanning them every 15 minutes bought nothing.
+DAYS_BACK = int(os.environ.get("ODDS_DAYS_BACK", "0"))
+DAYS_FORWARD = int(os.environ.get("ODDS_DAYS_FORWARD", "0"))
+
+# How close to kickoff counts as "closing line" territory -- a second
+# capture only happens once a match is within this many minutes of
+# kickoff, capturing the most informative snapshot for a betting model.
+CLOSING_WINDOW_MINUTES = 45
 
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"
 ODDS_URL_TMPL = "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/events/{event_id}/competitions/{comp_id}/odds"
@@ -157,6 +171,29 @@ def match_id_map(engine, season):
     return {(h, a): mid for mid, h, a in rows}
 
 
+def has_games_today(engine, season):
+    """Cheap, FREE check (no ScraperAPI credits, just a database query) --
+    the fixture list is already fully synced in `matches`, so we can know
+    whether today is a gameday before spending any ESPN/proxy requests at
+    all. Used to skip the frequent job entirely on non-gamedays."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("select 1 from matches where season = :season and match_date = current_date limit 1"),
+            {"season": season},
+        ).fetchone()
+    return row is not None
+
+
+def minutes_until_kickoff(game_time_iso):
+    """game_time_iso is ESPN's ISO timestamp (e.g. '2026-08-21T19:00Z').
+    Returns minutes until kickoff (negative if already started/passed)."""
+    try:
+        kickoff = datetime.strptime(game_time_iso, "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    return (kickoff - datetime.now(timezone.utc)).total_seconds() / 60
+
+
 def process_game(conn, teams, matches, game):
     home_code = NORMALIZED_NAME_TO_CODE.get(normalize_team_name(game["home_team"]))
     away_code = NORMALIZED_NAME_TO_CODE.get(normalize_team_name(game["away_team"]))
@@ -168,6 +205,29 @@ def process_game(conn, teams, matches, game):
     match_id = matches.get((home_id, away_id))
     if match_id is None:
         print(f"  SKIP: no matching database row for {game['home_team']} vs {game['away_team']}", flush=True)
+        return
+
+    # Time-gating: GitHub Actions cron can't dynamically schedule "N
+    # minutes before THIS match's kickoff" (schedules are static, kickoff
+    # times vary week to week) -- so this runs frequently instead, and
+    # decides per-match whether to actually capture right now. Always
+    # capture the FIRST snapshot we ever see for a match (an early
+    # reference point), then only capture again once within
+    # CLOSING_WINDOW_MINUTES of kickoff (the closing line -- the most
+    # informative single snapshot for a betting model). This avoids
+    # writing a near-duplicate row every single run for a match that's
+    # still hours away.
+    mins_to_kickoff = minutes_until_kickoff(game.get("game_time"))
+    already_captured = conn.execute(
+        text("select 1 from odds where match_id = :match_id and source = 'espn_draftkings' limit 1"),
+        {"match_id": match_id},
+    ).fetchone() is not None
+
+    is_closing_window = mins_to_kickoff is not None and 0 <= mins_to_kickoff <= CLOSING_WINDOW_MINUTES
+    if already_captured and not is_closing_window:
+        print(f"  SKIP (not yet in closing window): {game['home_team']} vs {game['away_team']} "
+              f"({mins_to_kickoff:.0f} min to kickoff)" if mins_to_kickoff is not None else
+              f"  SKIP (already captured, no kickoff time available): {game['home_team']} vs {game['away_team']}", flush=True)
         return
 
     try:
@@ -188,12 +248,22 @@ def process_game(conn, teams, matches, game):
         """),
         {"match_id": match_id, "home_odds": home_ml, "away_odds": away_ml, "draw_odds": draw_ml},
     )
-    print(f"  wrote odds: {game['home_team']} ({home_ml}) vs {game['away_team']} ({away_ml}), draw ({draw_ml})", flush=True)
+    tag = "closing" if is_closing_window else "opening"
+    print(f"  wrote {tag} odds: {game['home_team']} ({home_ml}) vs {game['away_team']} ({away_ml}), draw ({draw_ml})", flush=True)
 
 
 if __name__ == "__main__":
     teams = teams_map(engine)
     matches = match_id_map(engine, SEASON)
+
+    # For the narrow/frequent job specifically (DAYS_FORWARD=0, i.e. today
+    # only): skip entirely, before spending any ScraperAPI credits, if
+    # today isn't even a gameday. The daily-wide job (DAYS_FORWARD>0)
+    # always runs regardless, since its job is discovering upcoming
+    # fixtures over the next week, not reacting to today specifically.
+    if DAYS_FORWARD == 0 and DAYS_BACK == 0 and not has_games_today(engine, SEASON):
+        print("No fixtures today -- skipping entirely, no requests made.", flush=True)
+        raise SystemExit(0)
 
     end_date = date.today() + timedelta(days=DAYS_FORWARD)
     start_date = date.today() - timedelta(days=DAYS_BACK)

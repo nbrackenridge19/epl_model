@@ -30,6 +30,8 @@ import os
 from datetime import date, timedelta
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -39,8 +41,11 @@ SEASON = 2627
 
 # Poll today +/- this many days -- narrow window since this is meant to
 # run frequently close to kickoff, not scan far ahead.
+# Today only -- confirmed via testing that lineups don't post a full day
+# ahead of kickoff, so checking tomorrow on every run was pure waste
+# (extra ScraperAPI credits for zero chance of finding anything).
 DAYS_BACK = 0
-DAYS_FORWARD = 1
+DAYS_FORWARD = 0
 
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"
 SUMMARY_URL_TMPL = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event={event_id}"
@@ -97,6 +102,18 @@ def match_id_map(engine, season):
             {"season": season},
         ).fetchall()
     return {(h, a): mid for mid, h, a in rows}
+
+
+def has_games_today(engine, season):
+    """Same free (no ScraperAPI credits) gameday check as the odds
+    scraper -- skip entirely on non-gamedays before spending any
+    requests at all."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("select 1 from matches where season = :season and match_date = current_date limit 1"),
+            {"season": season},
+        ).fetchone()
+    return row is not None
 
 
 def get_or_create_player(conn, name):
@@ -184,6 +201,10 @@ def process_game(conn, teams, matches, game):
 if __name__ == "__main__":
     teams = teams_map(engine)
     matches = match_id_map(engine, SEASON)
+
+    if not has_games_today(engine, SEASON):
+        print("No fixtures today -- skipping entirely, no requests made.", flush=True)
+        raise SystemExit(0)
 
     end_date = date.today() + timedelta(days=DAYS_FORWARD)
     start_date = date.today() - timedelta(days=DAYS_BACK)
