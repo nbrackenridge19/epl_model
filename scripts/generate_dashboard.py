@@ -67,6 +67,26 @@ def get_latest_model(engine):
     return version, {name: coef for name, coef in coefs}
 
 
+def get_missing_xg_count(engine):
+    """Same query as enter_xg.py's get_missing_xg, just a count for the
+    dashboard's warning banner -- enter_xg.py itself has to stay a local,
+    interactive script (it prompts for input, which can't run inside a
+    scheduled cloud job), so this is just the visible reminder that
+    something needs your attention there."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                select count(*)
+                from matches m
+                left join match_team_stats mts_h on mts_h.match_id = m.id and mts_h.team_id = m.home_team_id
+                left join match_team_stats mts_a on mts_a.match_id = m.id and mts_a.team_id = m.away_team_id
+                where m.status = 'completed'
+                  and (mts_h.xg is null or mts_a.xg is null or mts_h.id is null or mts_a.id is null)
+            """)
+        ).fetchone()
+    return row[0]
+
+
 def get_current_bankroll(engine):
     with engine.connect() as conn:
         settled_profit = conn.execute(
@@ -273,7 +293,7 @@ def get_season_summaries(engine):
     return summaries
 
 
-def render_html(bankroll, model_version, results, settled_bets, season_summaries):
+def render_html(bankroll, model_version, results, settled_bets, season_summaries, missing_xg_count):
     rows_html = ""
     for r in results:
         badge = {"bet": "BET", "pass": "pass", "too_early": "too early",
@@ -348,6 +368,15 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
             "</tr>"
         )
 
+    xg_warning_html = ""
+    if missing_xg_count > 0:
+        xg_warning_html = (
+            f"<div style=\"background:#fff3cd; border:1px solid #ffc107; border-radius:6px; "
+            f"padding:10px 12px; margin-bottom:16px; font-size:14px;\">"
+            f"&#9888; {missing_xg_count} completed match{'es' if missing_xg_count != 1 else ''} "
+            f"missing xG &mdash; run enter_xg.py</div>"
+        )
+
     html = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -357,6 +386,7 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
         f"<div class=\"meta\">Bankroll: ${bankroll:,.2f} &middot; "
         f"Model version fit {model_version[1].strftime('%Y-%m-%d')} &middot; "
         f"Updated {date.today()}</div>"
+        f"{xg_warning_html}"
         "<table><tr><th>Date</th><th>Team</th><th>Model %</th><th>Market %</th>"
         f"<th>Stake</th><th>Decision</th></tr>{rows_html}</table>"
         "<h2>Results</h2>"
@@ -407,7 +437,10 @@ if __name__ == "__main__":
     season_summaries = get_season_summaries(engine)
     print(f"Found {len(season_summaries)} seasons with settled bet history.")
 
+    missing_xg_count = get_missing_xg_count(engine)
+    print(f"Missing xG: {missing_xg_count} completed matches.")
+
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     with open(OUTPUT_PATH, "w") as f:
-        f.write(render_html(bankroll, version, results, settled_bets, season_summaries))
+        f.write(render_html(bankroll, version, results, settled_bets, season_summaries, missing_xg_count))
     print(f"Dashboard written to {OUTPUT_PATH}")
