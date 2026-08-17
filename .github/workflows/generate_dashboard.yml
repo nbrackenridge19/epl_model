@@ -1,0 +1,40 @@
+name: Generate dashboard
+
+# Runs on the same frequent schedule as the lineup poller/odds scraper --
+# cheap to run (pure database reads, no ScraperAPI credits involved), so
+# no need for the same gameday pre-check those use to conserve credits.
+# Only commits back to the repo if the generated HTML actually changed,
+# so this doesn't create a flood of empty commits when nothing's new.
+on:
+  schedule:
+    - cron: "*/10 11-21 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install sqlalchemy psycopg2-binary
+
+      - name: Generate dashboard
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/generate_dashboard.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --staged --quiet || git commit -m "Update dashboard"
+          git push
