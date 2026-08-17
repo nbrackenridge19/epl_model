@@ -171,10 +171,10 @@ def evaluate_side(model_prob, ml, bankroll, edge_threshold, games_played):
     kf = model_prob - (1 - model_prob) / b
 
     if edge_threshold is None or kf < edge_threshold * 2:
-        return {"status": "pass", "model_prob": model_prob, "implied_prob": implied_prob, "kf": kf}
+        return {"status": "pass", "model_prob": model_prob, "implied_prob": implied_prob, "moneyline": ml, "kf": kf}
 
     stake = kf * bankroll * KELLY_FRACTION
-    return {"status": "bet", "model_prob": model_prob, "implied_prob": implied_prob, "kf": kf, "stake": stake}
+    return {"status": "bet", "model_prob": model_prob, "implied_prob": implied_prob, "moneyline": ml, "kf": kf, "stake": stake}
 
 
 def record_bet(conn, match_id, team_id, evaluation):
@@ -187,12 +187,34 @@ def record_bet(conn, match_id, team_id, evaluation):
                 set predicted_prob = excluded.predicted_prob, odds_used = excluded.odds_used,
                     stake = excluded.stake, placed_at = excluded.placed_at
         """),
+        # odds_used stores the actual moneyline (e.g. -150), NOT the implied
+        # probability -- needed for exact payout math when settling later.
+        # implied_prob is still used for the dashboard's own "Market %"
+        # display, just not what gets persisted here.
         {"match_id": match_id, "team_id": team_id, "predicted_prob": evaluation.get("model_prob"),
-         "odds_used": evaluation.get("implied_prob"), "stake": stake},
+         "odds_used": evaluation.get("moneyline"), "stake": stake},
     )
 
 
-def render_html(bankroll, model_version, results):
+def get_settled_bets(engine):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                select m.match_date, t.code as team_code, (m.home_team_id = b.team_id) as is_home,
+                       b.predicted_prob, b.odds_used, b.stake, b.outcome, b.profit, b.bankroll_after
+                from bets b
+                join matches m on m.id = b.match_id
+                join teams t on t.id = b.team_id
+                where m.season = :season and b.outcome is not null
+                order by m.match_date desc, b.stake desc
+                limit 100
+            """),
+            {"season": SEASON},
+        ).fetchall()
+    return rows
+
+
+def render_html(bankroll, model_version, results, settled_bets):
     rows_html = ""
     for r in results:
         badge = {"bet": "BET", "pass": "pass", "too_early": "too early",
@@ -213,10 +235,30 @@ def render_html(bankroll, model_version, results):
             "</tr>"
         )
 
+    history_rows_html = ""
+    for h in settled_bets:
+        match_date, team_code, is_home, predicted_prob, odds_used, stake, outcome, profit, bankroll_after = h
+        if stake and stake > 0:
+            result_str = "WON" if outcome else "lost"
+            result_color = "#1a7f37" if outcome else "#c0392b"
+            stake_str = f"${stake:.2f}"
+            profit_str = f"{'+' if profit >= 0 else ''}${profit:.2f}"
+        else:
+            result_str, result_color, stake_str, profit_str = "passed", "#999", "-", "-"
+        history_rows_html += (
+            "<tr>"
+            f"<td>{match_date}</td>"
+            f"<td>{team_code.upper()} {'(H)' if is_home else '(A)'}</td>"
+            f"<td>{stake_str}</td>"
+            f"<td><span style=\"color:{result_color}; font-weight:600;\">{result_str}</span></td>"
+            f"<td>{profit_str}</td>"
+            "</tr>"
+        )
+
     style = (
         "body { font-family: -apple-system, sans-serif; max-width: 700px; margin: 0 auto; "
         "padding: 16px; background: #fafafa; } "
-        "h1 { font-size: 20px; } "
+        "h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; } "
         ".meta { color: #666; font-size: 13px; margin-bottom: 16px; } "
         "table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; "
         "overflow: hidden; } "
@@ -236,6 +278,9 @@ def render_html(bankroll, model_version, results):
         f"Updated {date.today()}</div>"
         "<table><tr><th>Date</th><th>Team</th><th>Model %</th><th>Market %</th>"
         f"<th>Stake</th><th>Decision</th></tr>{rows_html}</table>"
+        "<h2>Results</h2>"
+        "<table><tr><th>Date</th><th>Team</th><th>Stake</th><th>Result</th><th>Profit</th></tr>"
+        f"{history_rows_html}</table>"
         "</body></html>"
     )
     return html
@@ -271,7 +316,10 @@ if __name__ == "__main__":
                 if evaluation["status"] in ("bet", "pass"):
                     record_bet(conn, match_id, team_id, evaluation)
 
+    settled_bets = get_settled_bets(engine)
+    print(f"Found {len(settled_bets)} settled bets to show in history.")
+
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     with open(OUTPUT_PATH, "w") as f:
-        f.write(render_html(bankroll, version, results))
+        f.write(render_html(bankroll, version, results, settled_bets))
     print(f"Dashboard written to {OUTPUT_PATH}")
