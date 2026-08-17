@@ -239,8 +239,8 @@ def render_html(bankroll, model_version, results, settled_bets):
     for h in settled_bets:
         match_date, team_code, is_home, predicted_prob, odds_used, stake, outcome, profit, bankroll_after = h
         if stake and stake > 0:
-            result_str = "WON" if outcome else "lost"
-            result_color = "#1a7f37" if outcome else "#c0392b"
+            result_str = "WON" if outcome == "win" else "lost"
+            result_color = "#1a7f37" if outcome == "win" else "#c0392b"
             stake_str = f"${stake:.2f}"
             profit_str = f"{'+' if profit >= 0 else ''}${profit:.2f}"
         else:

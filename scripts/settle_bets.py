@@ -98,7 +98,7 @@ if __name__ == "__main__":
                     update bets set outcome = :outcome, profit = :profit, bankroll_after = :bankroll_after
                     where id = :id
                 """),
-                {"outcome": won, "profit": profit, "bankroll_after": running_bankroll, "id": bet_id},
+                {"outcome": "win" if won else "loss", "profit": profit, "bankroll_after": running_bankroll, "id": bet_id},
             )
             print(f"  settled bet {bet_id} ({match_date}): {'WON' if won else 'lost'}, "
                   f"stake=${stake:.2f}, profit=${profit:.2f}, bankroll=${running_bankroll:,.2f}")
