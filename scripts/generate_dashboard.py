@@ -214,7 +214,31 @@ def get_settled_bets(engine):
     return rows
 
 
-def render_html(bankroll, model_version, results, settled_bets):
+def get_season_summaries(engine):
+    """Every season with real settled bets, including the historically
+    migrated ones -- not just the current season. No starting-bankroll
+    baseline needed here since this only sums profit directly, not a
+    running bankroll total (we don't have a confirmed starting bankroll
+    for every historical season, only 2025-26 and 2026-27)."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                select m.season,
+                    count(*) filter (where b.stake > 0) as bets_placed,
+                    count(*) filter (where b.stake > 0 and b.outcome = 'win') as wins,
+                    count(*) filter (where b.stake > 0 and b.outcome = 'loss') as losses,
+                    coalesce(sum(b.profit) filter (where b.stake > 0), 0) as total_profit
+                from bets b
+                join matches m on m.id = b.match_id
+                where b.outcome is not null
+                group by m.season
+                order by m.season
+            """)
+        ).fetchall()
+    return rows
+
+
+def render_html(bankroll, model_version, results, settled_bets, season_summaries):
     rows_html = ""
     for r in results:
         badge = {"bet": "BET", "pass": "pass", "too_early": "too early",
@@ -267,6 +291,22 @@ def render_html(bankroll, model_version, results, settled_bets):
         "@media (max-width: 480px) { th, td { font-size: 12px; padding: 8px 4px; } }"
     )
 
+    season_rows_html = ""
+    for s in season_summaries:
+        season, bets_placed, wins, losses, total_profit = s
+        win_pct = f"{wins / bets_placed:.0%}" if bets_placed else "-"
+        profit_str = f"{'+' if total_profit >= 0 else ''}${total_profit:,.2f}"
+        profit_color = "#1a7f37" if total_profit >= 0 else "#c0392b"
+        season_display = f"{str(season)[:2]}-{str(season)[2:]}"  # e.g. 2526 -> 25-26
+        season_rows_html += (
+            "<tr>"
+            f"<td>{season_display}</td>"
+            f"<td>{bets_placed}</td>"
+            f"<td>{wins}-{losses} ({win_pct})</td>"
+            f"<td><span style=\"color:{profit_color}; font-weight:600;\">{profit_str}</span></td>"
+            "</tr>"
+        )
+
     html = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -281,6 +321,9 @@ def render_html(bankroll, model_version, results, settled_bets):
         "<h2>Results</h2>"
         "<table><tr><th>Date</th><th>Team</th><th>Stake</th><th>Result</th><th>Profit</th></tr>"
         f"{history_rows_html}</table>"
+        "<h2>Past Seasons</h2>"
+        "<table><tr><th>Season</th><th>Bets</th><th>Record</th><th>Total Profit</th></tr>"
+        f"{season_rows_html}</table>"
         "</body></html>"
     )
     return html
@@ -319,7 +362,10 @@ if __name__ == "__main__":
     settled_bets = get_settled_bets(engine)
     print(f"Found {len(settled_bets)} settled bets to show in history.")
 
+    season_summaries = get_season_summaries(engine)
+    print(f"Found {len(season_summaries)} seasons with settled bet history.")
+
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     with open(OUTPUT_PATH, "w") as f:
-        f.write(render_html(bankroll, version, results, settled_bets))
+        f.write(render_html(bankroll, version, results, settled_bets, season_summaries))
     print(f"Dashboard written to {OUTPUT_PATH}")
