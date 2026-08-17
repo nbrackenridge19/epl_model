@@ -206,12 +206,12 @@ def process_game(conn, teams, matches, game):
             player_id = get_or_create_player(conn, name)
             conn.execute(
                 text("""
-                    insert into predicted_lineups (match_id, player_id, predicted_status, scraped_at)
-                    values (:match_id, :player_id, :status, now())
+                    insert into predicted_lineups (match_id, player_id, team_id, predicted_status, scraped_at)
+                    values (:match_id, :player_id, :team_id, :status, now())
                     on conflict (match_id, player_id) do update
                         set predicted_status = excluded.predicted_status, scraped_at = excluded.scraped_at
                 """),
-                {"match_id": match_id, "player_id": player_id, "status": predicted_status},
+                {"match_id": match_id, "player_id": player_id, "team_id": team_id, "status": predicted_status},
             )
             total_written += 1
 
