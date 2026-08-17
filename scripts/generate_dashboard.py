@@ -216,26 +216,61 @@ def get_settled_bets(engine):
 
 def get_season_summaries(engine):
     """Every season with real settled bets, including the historically
-    migrated ones -- not just the current season. No starting-bankroll
-    baseline needed here since this only sums profit directly, not a
-    running bankroll total (we don't have a confirmed starting bankroll
-    for every historical season, only 2025-26 and 2026-27)."""
+    migrated ones. LogLoss/VLogLoss replicate the original spreadsheet's
+    formula exactly: computed across EVERY evaluated instance (bet AND
+    pass decisions both), not just placed bets -- this is a model
+    calibration metric, deliberately separate from the betting-decision
+    layer. LogLoss uses the model's own predicted_prob; VLogLoss uses
+    the market's implied probability from the same odds_used value, as
+    a baseline to compare the model's calibration against the market's."""
     with engine.connect() as conn:
-        rows = conn.execute(
+        raw = conn.execute(
             text("""
-                select m.season,
-                    count(*) filter (where b.stake > 0) as bets_placed,
-                    count(*) filter (where b.stake > 0 and b.outcome = 'win') as wins,
-                    count(*) filter (where b.stake > 0 and b.outcome = 'loss') as losses,
-                    coalesce(sum(b.profit) filter (where b.stake > 0), 0) as total_profit
+                select m.season, b.stake, b.outcome, b.profit, b.predicted_prob, b.odds_used
                 from bets b
                 join matches m on m.id = b.match_id
                 where b.outcome is not null
-                group by m.season
-                order by m.season
             """)
         ).fetchall()
-    return rows
+
+    by_season = {}
+    for season, stake, outcome, profit, predicted_prob, odds_used in raw:
+        by_season.setdefault(season, []).append(
+            {"stake": stake or 0, "outcome": outcome, "profit": profit or 0,
+             "predicted_prob": predicted_prob, "odds_used": odds_used}
+        )
+
+    summaries = []
+    for season in sorted(by_season):
+        bets = by_season[season]
+        placed = [b for b in bets if b["stake"] > 0]
+        wins = sum(1 for b in placed if b["outcome"] == "win")
+        losses = sum(1 for b in placed if b["outcome"] == "loss")
+        total_profit = sum(b["profit"] for b in placed)
+        total_wagered = sum(b["stake"] for b in placed)
+        return_pct = (total_profit / total_wagered) if total_wagered else None
+
+        model_losses, market_losses = [], []
+        for b in bets:  # every evaluated instance, not just placed -- matches the original formula
+            y = 1.0 if b["outcome"] == "win" else 0.0
+            p = b["predicted_prob"]
+            if p is not None and 0 < p < 1:
+                model_losses.append(-(y * math.log(p) + (1 - y) * math.log(1 - p)))
+            ml = b["odds_used"]
+            if ml is not None:
+                implied = moneyline_to_implied_prob(ml)
+                if implied is not None and 0 < implied < 1:
+                    market_losses.append(-(y * math.log(implied) + (1 - y) * math.log(1 - implied)))
+
+        model_logloss = sum(model_losses) / len(model_losses) if model_losses else None
+        market_logloss = sum(market_losses) / len(market_losses) if market_losses else None
+
+        summaries.append({
+            "season": season, "bets_placed": len(placed), "wins": wins, "losses": losses,
+            "total_profit": total_profit, "total_wagered": total_wagered, "return_pct": return_pct,
+            "model_logloss": model_logloss, "market_logloss": market_logloss,
+        })
+    return summaries
 
 
 def render_html(bankroll, model_version, results, settled_bets, season_summaries):
@@ -293,17 +328,23 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
 
     season_rows_html = ""
     for s in season_summaries:
-        season, bets_placed, wins, losses, total_profit = s
-        win_pct = f"{wins / bets_placed:.0%}" if bets_placed else "-"
-        profit_str = f"{'+' if total_profit >= 0 else ''}${total_profit:,.2f}"
-        profit_color = "#1a7f37" if total_profit >= 0 else "#c0392b"
-        season_display = f"{str(season)[:2]}-{str(season)[2:]}"  # e.g. 2526 -> 25-26
+        win_pct = f"{s['wins'] / s['bets_placed']:.0%}" if s['bets_placed'] else "-"
+        profit_str = f"{'+' if s['total_profit'] >= 0 else ''}${s['total_profit']:,.2f}"
+        profit_color = "#1a7f37" if s['total_profit'] >= 0 else "#c0392b"
+        return_str = f"{s['return_pct']:+.1%}" if s['return_pct'] is not None else "-"
+        model_ll = f"{s['model_logloss']:.3f}" if s['model_logloss'] is not None else "-"
+        market_ll = f"{s['market_logloss']:.3f}" if s['market_logloss'] is not None else "-"
+        season_display = f"{str(s['season'])[:2]}-{str(s['season'])[2:]}"
         season_rows_html += (
             "<tr>"
             f"<td>{season_display}</td>"
-            f"<td>{bets_placed}</td>"
-            f"<td>{wins}-{losses} ({win_pct})</td>"
+            f"<td>{s['bets_placed']}</td>"
+            f"<td>{s['wins']}-{s['losses']} ({win_pct})</td>"
+            f"<td>${s['total_wagered']:,.2f}</td>"
             f"<td><span style=\"color:{profit_color}; font-weight:600;\">{profit_str}</span></td>"
+            f"<td>{return_str}</td>"
+            f"<td>{model_ll}</td>"
+            f"<td>{market_ll}</td>"
             "</tr>"
         )
 
@@ -322,7 +363,8 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
         "<table><tr><th>Date</th><th>Team</th><th>Stake</th><th>Result</th><th>Profit</th></tr>"
         f"{history_rows_html}</table>"
         "<h2>Past Seasons</h2>"
-        "<table><tr><th>Season</th><th>Bets</th><th>Record</th><th>Total Profit</th></tr>"
+        "<table><tr><th>Season</th><th>Bets</th><th>Record</th><th>Wagered</th>"
+        "<th>Profit</th><th>Return</th><th>LogLoss</th><th>Mkt LogLoss</th></tr>"
         f"{season_rows_html}</table>"
         "</body></html>"
     )
