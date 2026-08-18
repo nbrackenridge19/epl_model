@@ -198,11 +198,14 @@ def process_game(conn, teams, matches, game):
         elif formation and DRY_RUN:
             print(f"  [DRY RUN] would write expected formation: {home_away} = {formation}", flush=True)
 
+        starter_count = 0
         for p in roster:
             name = (p.get("athlete") or {}).get("fullName")
             if not name:
                 continue
             predicted_status = 2 if p.get("starter") else 1
+            if predicted_status == 2:
+                starter_count += 1
 
             if DRY_RUN:
                 continue
@@ -217,6 +220,18 @@ def process_game(conn, teams, matches, game):
                 {"match_id": match_id, "player_id": player_id, "team_id": team_id, "status": predicted_status},
             )
             total_written += 1
+
+        # Headcount sanity check -- a genuinely different failure mode
+        # from "missing player_ratings" (which is handled separately,
+        # see add_player_ratings.py). get_or_create_player() means the
+        # count should basically never drop below 11 just because a
+        # player is new to our database -- if it does, that points to a
+        # malformed/incomplete ESPN response for this specific player,
+        # not a data-gap issue.
+        if starter_count != 11:
+            print(f"  WARNING: {game['home_team'] if is_home else game['away_team']} "
+                  f"({home_away}) shows {starter_count} starters, not 11 -- "
+                  f"likely a parsing/API issue, not a missing-player issue.", flush=True)
 
     label = "[DRY RUN] would write" if DRY_RUN else "wrote"
     print(f"  {game['home_team']} vs {game['away_team']}: {label} {total_written} predicted lineup rows", flush=True)

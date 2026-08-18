@@ -87,6 +87,58 @@ def get_missing_xg_count(engine):
     return row[0]
 
 
+def get_missing_ratings_count(engine):
+    """Same query as add_player_ratings.py's get_missing_ratings, just a
+    count for the warning banner -- same reasoning as the xG one, this
+    has to stay an interactive local script, not something a scheduled
+    job can run on its own."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                select count(*) from (
+                    select distinct player_id, team_id from (
+                        select player_id, team_id from player_match_appearances pma
+                        join matches m on m.id = pma.match_id where m.season = :season
+                        union
+                        select player_id, team_id from predicted_lineups pl
+                        join matches m on m.id = pl.match_id where m.season = :season
+                    ) seen
+                    where not exists (
+                        select 1 from player_ratings pr
+                        where pr.player_id = seen.player_id and pr.team_id = seen.team_id and pr.season = :season
+                    )
+                ) x
+            """),
+            {"season": SEASON},
+        ).fetchone()
+    return row[0]
+
+
+def get_headcount_issues_count(engine):
+    """A genuinely different check from missing ratings -- this catches
+    a malformed/incomplete ESPN API response for a specific player (the
+    parsing loop silently skips an entry with no name field), not a
+    'we don't have this player's data yet' situation. Since
+    get_or_create_player() always creates a row for any name it DOES
+    see, the starter count should basically never legitimately drop
+    below 11 for a posted lineup."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                select count(*) from (
+                    select pl.match_id, pl.team_id, count(*) filter (where pl.predicted_status = 2) as starters
+                    from predicted_lineups pl
+                    join matches m on m.id = pl.match_id
+                    where m.season = :season
+                    group by pl.match_id, pl.team_id
+                    having count(*) filter (where pl.predicted_status = 2) != 11
+                ) x
+            """),
+            {"season": SEASON},
+        ).fetchone()
+    return row[0]
+
+
 def get_current_bankroll(engine):
     with engine.connect() as conn:
         settled_profit = conn.execute(
@@ -293,7 +345,7 @@ def get_season_summaries(engine):
     return summaries
 
 
-def render_html(bankroll, model_version, results, settled_bets, season_summaries, missing_xg_count):
+def render_html(bankroll, model_version, results, settled_bets, season_summaries, missing_xg_count, missing_ratings_count, headcount_issues_count):
     rows_html = ""
     for r in results:
         badge = {"bet": "BET", "pass": "pass", "too_early": "too early",
@@ -377,6 +429,27 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
             f"missing xG &mdash; run enter_xg.py</div>"
         )
 
+    ratings_warning_html = ""
+    if missing_ratings_count > 0:
+        ratings_warning_html = (
+            f"<div style=\"background:#fff3cd; border:1px solid #ffc107; border-radius:6px; "
+            f"padding:10px 12px; margin-bottom:16px; font-size:14px;\">"
+            f"&#9888; {missing_ratings_count} player{'s' if missing_ratings_count != 1 else ''} "
+            f"missing a {SEASON} rating &mdash; run add_player_ratings.py</div>"
+        )
+
+    headcount_warning_html = ""
+    if headcount_issues_count > 0:
+        # Red, not yellow -- this is a different class of problem (an
+        # ESPN API/parsing issue) from the yellow "known, expected,
+        # needs manual entry" warnings above.
+        headcount_warning_html = (
+            f"<div style=\"background:#f8d7da; border:1px solid #dc3545; border-radius:6px; "
+            f"padding:10px 12px; margin-bottom:16px; font-size:14px;\">"
+            f"&#9888; {headcount_issues_count} team-match{'es' if headcount_issues_count != 1 else ''} "
+            f"showing a starter count &ne; 11 &mdash; likely an ESPN parsing issue, check poll_espn_lineups.py logs</div>"
+        )
+
     html = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -387,6 +460,8 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
         f"Model version fit {model_version[1].strftime('%Y-%m-%d')} &middot; "
         f"Updated {date.today()}</div>"
         f"{xg_warning_html}"
+        f"{ratings_warning_html}"
+        f"{headcount_warning_html}"
         "<table><tr><th>Date</th><th>Team</th><th>Model %</th><th>Market %</th>"
         f"<th>Stake</th><th>Decision</th></tr>{rows_html}</table>"
         "<h2>Results</h2>"
@@ -440,7 +515,14 @@ if __name__ == "__main__":
     missing_xg_count = get_missing_xg_count(engine)
     print(f"Missing xG: {missing_xg_count} completed matches.")
 
+    missing_ratings_count = get_missing_ratings_count(engine)
+    print(f"Missing player ratings: {missing_ratings_count} players.")
+
+    headcount_issues_count = get_headcount_issues_count(engine)
+    print(f"Headcount issues: {headcount_issues_count} team-matches with starters != 11.")
+
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     with open(OUTPUT_PATH, "w") as f:
-        f.write(render_html(bankroll, version, results, settled_bets, season_summaries, missing_xg_count))
+        f.write(render_html(bankroll, version, results, settled_bets, season_summaries,
+                             missing_xg_count, missing_ratings_count, headcount_issues_count))
     print(f"Dashboard written to {OUTPUT_PATH}")
