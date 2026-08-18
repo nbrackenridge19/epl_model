@@ -117,7 +117,10 @@ def has_games_today(engine, season):
 
 
 def get_or_create_player(conn, name):
-    name = name.strip()
+    # CRITICAL: lowercase, not just strip -- see scrape_fbref_matches.py
+    # for the full explanation. ESPN's athlete.fullName is Title Case;
+    # the historical migration used lowercase throughout.
+    name = name.strip().lower()
     pid = conn.execute(
         text("insert into players (fbref_name) values (:name) on conflict do nothing returning id"),
         {"name": name},

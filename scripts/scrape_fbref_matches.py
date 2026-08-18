@@ -146,7 +146,13 @@ def match_id_map(engine, season):
 
 
 def get_or_create_player(conn, name):
-    name = name.strip()
+    # CRITICAL: lowercase, not just strip. FBref match reports return
+    # Title Case names ("Hugo Ekitike"), but the entire historical
+    # migration used lowercase ("hugo ekitike") -- without this, every
+    # live scrape silently created a duplicate player row instead of
+    # matching the real, existing one (confirmed: this bug affected
+    # hundreds of players -- see conversation for the cleanup).
+    name = name.strip().lower()
     pid = conn.execute(
         text("insert into players (fbref_name) values (:name) on conflict do nothing returning id"),
         {"name": name},
