@@ -1,0 +1,33 @@
+name: Settle bets
+
+# Paper-trading settlement only -- no real money or real bets ever placed.
+# This just fills in outcome/profit on already-recorded `bets` rows by
+# comparing each pick against the real final score once a match completes.
+# Deterministic, no judgment call involved (unlike enter_xg.py or
+# add_player_ratings.py), so unlike those two this is safe to fully
+# automate rather than run by hand.
+#
+# Runs once daily, well after the FBref scraper's own daily run, so final
+# scores are already in the database by the time this looks for them.
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 8am UTC daily -- after the FBref scraper's overnight run
+  workflow_dispatch: {}
+
+jobs:
+  settle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install sqlalchemy psycopg2-binary
+
+      - name: Run settle_bets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/settle_bets.py
