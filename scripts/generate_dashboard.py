@@ -139,6 +139,37 @@ def get_headcount_issues_count(engine):
     return row[0]
 
 
+def get_starter_counts(engine, season):
+    """Maps every (match_id, team_id) with ANY predicted_lineups rows this
+    season to its posted starter count -- not filtered down to just the
+    mismatched ones (that's get_headcount_issues_count's job for the
+    summary banner). Used to show a per-row 'Lineup Check' note right next
+    to each match/team's own betting recommendation, so a bad lineup pull
+    is visible exactly where it matters, not just as an aggregate count
+    somewhere else on the page."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                select pl.match_id, pl.team_id, count(*) filter (where pl.predicted_status = 2) as starters
+                from predicted_lineups pl
+                join matches m on m.id = pl.match_id
+                where m.season = :season
+                group by pl.match_id, pl.team_id
+            """),
+            {"season": season},
+        ).fetchall()
+    return {(r[0], r[1]): r[2] for r in rows}
+
+
+def lineup_check_message(starter_counts, match_id, team_id):
+    count = starter_counts.get((match_id, team_id))
+    if count is None:
+        return "No lineup posted yet"
+    if count != 11:
+        return f"{count} starters posted (expected 11)"
+    return ""
+
+
 def get_current_bankroll(engine):
     with engine.connect() as conn:
         settled_profit = conn.execute(
@@ -355,6 +386,10 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
         model_pct = f"{r['model_prob']:.1%}" if r.get("model_prob") is not None else "-"
         market_pct = f"{r['implied_prob']:.1%}" if r.get("implied_prob") is not None else "-"
         stake_str = f"${r['stake']:.2f}" if r["status"] == "bet" else "-"
+        lineup_check = r.get("lineup_check") or ""
+        lineup_check_html = (
+            f"<span style=\"color:#c0392b; font-weight:600;\">{lineup_check}</span>" if lineup_check else ""
+        )
         rows_html += (
             "<tr>"
             f"<td>{r['match_date']}</td>"
@@ -363,6 +398,7 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
             f"<td>{market_pct}</td>"
             f"<td>{stake_str}</td>"
             f"<td><span style=\"color:{badge_color}; font-weight:600;\">{badge}</span></td>"
+            f"<td>{lineup_check_html}</td>"
             "</tr>"
         )
 
@@ -463,7 +499,7 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
         f"{ratings_warning_html}"
         f"{headcount_warning_html}"
         "<table><tr><th>Date</th><th>Team</th><th>Model %</th><th>Market %</th>"
-        f"<th>Stake</th><th>Decision</th></tr>{rows_html}</table>"
+        f"<th>Stake</th><th>Decision</th><th>Lineup Check</th></tr>{rows_html}</table>"
         "<h2>Results</h2>"
         "<table><tr><th>Date</th><th>Team</th><th>Stake</th><th>Result</th><th>Profit</th></tr>"
         f"{history_rows_html}</table>"
@@ -486,6 +522,8 @@ if __name__ == "__main__":
     matches = get_candidate_matches(engine)
     print(f"Found {len(matches)} candidate matches with a posted lineup.")
 
+    starter_counts = get_starter_counts(engine, SEASON)
+
     results = []
     with engine.begin() as conn:
         for m in matches:
@@ -500,7 +538,10 @@ if __name__ == "__main__":
                 model_prob = compute_probability(coefs, team_code, features) if features else None
                 games_played = get_games_played(engine, team_id, match_date)
                 evaluation = evaluate_side(model_prob, ml, bankroll, edge_threshold, games_played)
-                evaluation.update({"match_date": match_date, "team_code": team_code, "is_home": is_home})
+                evaluation.update({
+                    "match_date": match_date, "team_code": team_code, "is_home": is_home,
+                    "lineup_check": lineup_check_message(starter_counts, match_id, team_id),
+                })
                 results.append(evaluation)
 
                 if evaluation["status"] in ("bet", "pass"):
