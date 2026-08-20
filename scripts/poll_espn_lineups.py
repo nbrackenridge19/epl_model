@@ -121,11 +121,37 @@ def get_or_create_player(conn, name):
     # for the full explanation. ESPN's athlete.fullName is Title Case;
     # the historical migration used lowercase throughout.
     name = name.strip().lower()
+
+    # Check BOTH crosswalk columns, not just fbref_name. ESPN and FBref
+    # names genuinely diverge for a real fraction of players (confirmed:
+    # ~10% of the 2025-26 roster, e.g. "karl hein" on ESPN vs "karl jakob
+    # hein" on FBref) -- matching fbref_name only was the actual root
+    # cause of at least some duplicate-player records found this project,
+    # since a real, already-known player would silently fail the old
+    # single-column match and get recreated under the ESPN spelling.
+    existing = conn.execute(
+        text("select id from players where espn_name = :name or fbref_name = :name limit 1"),
+        {"name": name},
+    ).fetchone()
+    if existing is not None:
+        return existing[0]
+
+    # Genuinely new player -- store the ESPN-sourced name as BOTH
+    # fbref_name and espn_name for now (best information available at
+    # creation time). If FBref later reports a different real spelling
+    # for this same person, that's a separate reconciliation to catch
+    # via the same duplicate-detection approach used earlier this
+    # project, not something this function can resolve on its own.
     pid = conn.execute(
-        text("insert into players (fbref_name) values (:name) on conflict do nothing returning id"),
+        text("""
+            insert into players (fbref_name, espn_name) values (:name, :name)
+            on conflict do nothing returning id
+        """),
         {"name": name},
     ).fetchone()
     if pid is None:
+        # Race guard: another process inserted this exact name between
+        # our check above and this insert.
         pid = conn.execute(text("select id from players where fbref_name = :name"), {"name": name}).fetchone()
     return pid[0]
 
