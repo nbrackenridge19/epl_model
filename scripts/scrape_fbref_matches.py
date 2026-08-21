@@ -154,16 +154,21 @@ def get_or_create_player(conn, name, team_id):
     # hundreds of players -- see conversation for the cleanup).
     name = name.strip().lower()
 
-    # fbref_name is no longer required to be globally unique (constraint
-    # dropped) -- real name collisions exist (e.g. two different real
-    # people both named "Ben Davies", one ex-Liverpool, one Tottenham/
-    # Wales). Team context is the disambiguator: prefer an existing
-    # player with this name who has real evidence (a match appearance or
-    # a rating row) of being associated with THIS specific team.
+    # Three name sources now: fbref_name, espn_name, and player_aliases
+    # (nicknames/shortened forms ESPN sometimes switches to mid-season,
+    # e.g. "Savio" for a player whose real name is "Savinho"/"Sávio", or
+    # "Toti" vs "Toti Gomes"). fbref_name is no longer required to be
+    # globally unique (constraint dropped), so team context remains the
+    # disambiguator: prefer an existing player with this name (any of
+    # the three sources) who has real evidence of being at THIS specific
+    # team.
     row = conn.execute(
         text("""
             select p.id from players p
-            where p.fbref_name = :name
+            where (
+                p.fbref_name = :name
+                or exists (select 1 from player_aliases pa where pa.player_id = p.id and pa.alias = :name)
+              )
               and (
                 exists (select 1 from player_match_appearances pma where pma.player_id = p.id and pma.team_id = :team_id)
                 or exists (select 1 from player_ratings pr where pr.player_id = p.id and pr.team_id = :team_id)
@@ -173,18 +178,35 @@ def get_or_create_player(conn, name, team_id):
         {"name": name, "team_id": team_id},
     ).fetchone()
     if row is not None:
+        # Confirmed via team context, but not matching fbref_name exactly
+        # -- this is a newly-observed alias. Record it now so next time
+        # (and every downstream feature relying on continuous appearance
+        # history, e.g. minutes-share) resolves instantly without relying
+        # on team-context matching succeeding again.
+        conn.execute(
+            text("insert into player_aliases (player_id, alias, source) values (:pid, :alias, 'fbref_scraper') on conflict do nothing"),
+            {"pid": row[0], "alias": name},
+        )
         return row[0]
 
     # No team-matched candidate. Fall back to a plain name match, but
     # only when it's unambiguous (exactly one existing player with this
-    # name) -- the normal case of a player's first-ever appearance at a
-    # new club. A genuine name collision with no team evidence on either
-    # side is exactly what this redesign exists to handle safely: rather
-    # than guess and risk silently merging two different real people,
-    # create a new row and flag it loudly for manual review (same
-    # process used to merge the Karl Hein / Kosta Tsimikas duplicates
-    # earlier this project, just run in the other direction).
-    candidates = conn.execute(text("select id from players where fbref_name = :name"), {"name": name}).fetchall()
+    # name, across all three sources) -- the normal case of a player's
+    # first-ever appearance at a new club. A genuine name collision with
+    # no team evidence on either side is exactly what this redesign
+    # exists to handle safely: rather than guess and risk silently
+    # merging two different real people, create a new row and flag it
+    # loudly for manual review (same process used to merge the Karl Hein
+    # / Kosta Tsimikas duplicates earlier this project, just run in the
+    # other direction).
+    candidates = conn.execute(
+        text("""
+            select distinct p.id from players p
+            where p.fbref_name = :name
+               or exists (select 1 from player_aliases pa where pa.player_id = p.id and pa.alias = :name)
+        """),
+        {"name": name},
+    ).fetchall()
     if len(candidates) == 1:
         return candidates[0][0]
     if len(candidates) > 1:
