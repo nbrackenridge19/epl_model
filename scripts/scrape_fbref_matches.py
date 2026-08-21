@@ -145,7 +145,7 @@ def match_id_map(engine, season):
     return {lg: (mid, h, a, st) for mid, lg, h, a, st in rows}
 
 
-def get_or_create_player(conn, name):
+def get_or_create_player(conn, name, team_id):
     # CRITICAL: lowercase, not just strip. FBref match reports return
     # Title Case names ("Hugo Ekitike"), but the entire historical
     # migration used lowercase ("hugo ekitike") -- without this, every
@@ -153,13 +153,49 @@ def get_or_create_player(conn, name):
     # matching the real, existing one (confirmed: this bug affected
     # hundreds of players -- see conversation for the cleanup).
     name = name.strip().lower()
-    pid = conn.execute(
-        text("insert into players (fbref_name) values (:name) on conflict do nothing returning id"),
+
+    # fbref_name is no longer required to be globally unique (constraint
+    # dropped) -- real name collisions exist (e.g. two different real
+    # people both named "Ben Davies", one ex-Liverpool, one Tottenham/
+    # Wales). Team context is the disambiguator: prefer an existing
+    # player with this name who has real evidence (a match appearance or
+    # a rating row) of being associated with THIS specific team.
+    row = conn.execute(
+        text("""
+            select p.id from players p
+            where p.fbref_name = :name
+              and (
+                exists (select 1 from player_match_appearances pma where pma.player_id = p.id and pma.team_id = :team_id)
+                or exists (select 1 from player_ratings pr where pr.player_id = p.id and pr.team_id = :team_id)
+              )
+            limit 1
+        """),
+        {"name": name, "team_id": team_id},
+    ).fetchone()
+    if row is not None:
+        return row[0]
+
+    # No team-matched candidate. Fall back to a plain name match, but
+    # only when it's unambiguous (exactly one existing player with this
+    # name) -- the normal case of a player's first-ever appearance at a
+    # new club. A genuine name collision with no team evidence on either
+    # side is exactly what this redesign exists to handle safely: rather
+    # than guess and risk silently merging two different real people,
+    # create a new row and flag it loudly for manual review (same
+    # process used to merge the Karl Hein / Kosta Tsimikas duplicates
+    # earlier this project, just run in the other direction).
+    candidates = conn.execute(text("select id from players where fbref_name = :name"), {"name": name}).fetchall()
+    if len(candidates) == 1:
+        return candidates[0][0]
+    if len(candidates) > 1:
+        print(f"  WARNING: name collision for '{name}' with no team match among {len(candidates)} "
+              f"existing players -- creating a new row rather than guessing. Needs manual review.", flush=True)
+
+    result = conn.execute(
+        text("insert into players (fbref_name) values (:name) returning id"),
         {"name": name},
     ).fetchone()
-    if pid is None:
-        pid = conn.execute(text("select id from players where fbref_name = :name"), {"name": name}).fetchone()
-    return pid[0]
+    return result[0]
 
 
 def discover_match_reports():
@@ -484,7 +520,7 @@ def process_match(conn, teams, matches, report):
 
     for team_id, players in [(home_id, data["home_players"]), (away_id, data["away_players"])]:
         for row in players:
-            player_id = get_or_create_player(conn, row["player"])
+            player_id = get_or_create_player(conn, row["player"], team_id)
             conn.execute(
                 text("""
                     insert into player_match_appearances (match_id, player_id, team_id, status, minutes_played)
