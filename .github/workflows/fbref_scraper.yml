@@ -26,4 +26,5 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
+          SCRAPERAPI_PREMIUM_LEVEL: ${{ secrets.SCRAPERAPI_PREMIUM_LEVEL }}
         run: python scripts/scrape_fbref_matches.py
