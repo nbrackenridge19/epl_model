@@ -92,6 +92,16 @@ def _add_premium_param(proxy_url, level):
 
 PROXY_URL = _add_premium_param(os.environ["SCRAPERAPI_PROXY_URL"], SCRAPERAPI_PREMIUM_LEVEL)
 
+# TEMPORARY DIAGNOSTIC -- remove once the real cause is confirmed. Shows
+# ONLY the username/parameter portion of the proxy URL actually being
+# used, never the password/API key, so this is safe to leave in logs.
+# Two runs (premium alone, then premium+render) produced the identical
+# ScraperAPI "protected domain" error either way -- before adding a
+# third parameter blind, need to confirm the modified URL is actually
+# what's being sent, rather than assume it and keep guessing.
+from urllib.parse import urlsplit as _urlsplit
+print(f"DIAGNOSTIC -- proxy username being sent: {_urlsplit(PROXY_URL).username}", flush=True)
+
 DRY_RUN = False
 MATCH_LIMIT = None  # None = process every completed match found, no cap
 
