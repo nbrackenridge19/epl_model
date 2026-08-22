@@ -241,13 +241,22 @@ def get_latest_odds(engine, match_id):
 
 
 def compute_probability(coefs, team_code, features):
-    logit = coefs.get("Intercept", 0.0)
+    # Cast every value to float explicitly. Postgres NUMERIC columns
+    # come back as Decimal via SQLAlchemy, and the 9 named features
+    # below stay Decimal-consistent throughout (Decimal coefficient *
+    # Decimal feature value), so that part silently worked. But a team
+    # with no fixed-effect coefficient (the promoted teams -- they've
+    # never appeared in the model's training data) hits the .get(...,
+    # 0.0) fallback, a literal Python float -- Decimal += float raises
+    # TypeError. Casting everything to float up front avoids this
+    # regardless of what type any individual value happens to be.
+    logit = float(coefs.get("Intercept", 0.0))
     names = ["avgatt", "xgfpgd", "xgapgd", "gkpgd", "possd", "strtd", "bertd", "stmsd", "formcd"]
     for name, value in zip(names, features):
         if value is None:
             return None
-        logit += coefs.get(name, 0.0) * value
-    logit += coefs.get(f"C(team_code)[T.{team_code}]", 0.0)
+        logit += float(coefs.get(name, 0.0)) * float(value)
+    logit += float(coefs.get(f"C(team_code)[T.{team_code}]", 0.0))
     return 1 / (1 + math.exp(-logit))
 
 
