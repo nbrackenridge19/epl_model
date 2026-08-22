@@ -161,13 +161,44 @@ def get_starter_counts(engine, season):
     return {(r[0], r[1]): r[2] for r in rows}
 
 
-def lineup_check_message(starter_counts, match_id, team_id):
+def get_starters_missing_ratings(engine, season):
+    """A genuinely different problem from a bad headcount: a team can show
+    exactly 11 posted starters (headcount check passes clean) while some
+    of those specific players still have no player_ratings row for this
+    team/season -- they silently drop out of the starters_rating average
+    (avg() just skips nulls) rather than causing any visible error. This
+    surfaced for real: three summer-import duplicate-name players had a
+    posted lineup land on the wrong player_id before being merged --
+    exactly the kind of thing this check exists to catch before it
+    affects a live prediction."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                select pl.match_id, pl.team_id, count(*) as missing_count
+                from predicted_lineups pl
+                where pl.predicted_status = 2
+                  and not exists (
+                      select 1 from player_ratings pr
+                      where pr.player_id = pl.player_id and pr.team_id = pl.team_id and pr.season = :season
+                  )
+                group by pl.match_id, pl.team_id
+            """),
+            {"season": season},
+        ).fetchall()
+    return {(r[0], r[1]): r[2] for r in rows}
+
+
+def lineup_check_message(starter_counts, missing_ratings, match_id, team_id):
     count = starter_counts.get((match_id, team_id))
     if count is None:
         return "No lineup posted yet"
+    messages = []
     if count != 11:
-        return f"{count} starters posted (expected 11)"
-    return ""
+        messages.append(f"{count} starters posted (expected 11)")
+    missing = missing_ratings.get((match_id, team_id), 0)
+    if missing > 0:
+        messages.append(f"{missing} starter{'s' if missing != 1 else ''} missing a {SEASON} rating")
+    return "; ".join(messages)
 
 
 def get_current_bankroll(engine):
@@ -532,6 +563,7 @@ if __name__ == "__main__":
     print(f"Found {len(matches)} candidate matches with a posted lineup.")
 
     starter_counts = get_starter_counts(engine, SEASON)
+    starters_missing_ratings = get_starters_missing_ratings(engine, SEASON)
 
     results = []
     with engine.begin() as conn:
@@ -549,7 +581,7 @@ if __name__ == "__main__":
                 evaluation = evaluate_side(model_prob, ml, bankroll, edge_threshold, games_played)
                 evaluation.update({
                     "match_date": match_date, "team_code": team_code, "is_home": is_home,
-                    "lineup_check": lineup_check_message(starter_counts, match_id, team_id),
+                    "lineup_check": lineup_check_message(starter_counts, starters_missing_ratings, match_id, team_id),
                 })
                 results.append(evaluation)
 
