@@ -92,16 +92,6 @@ def _add_premium_param(proxy_url, level):
 
 PROXY_URL = _add_premium_param(os.environ["SCRAPERAPI_PROXY_URL"], SCRAPERAPI_PREMIUM_LEVEL)
 
-# TEMPORARY DIAGNOSTIC -- remove once the real cause is confirmed. Shows
-# ONLY the username/parameter portion of the proxy URL actually being
-# used, never the password/API key, so this is safe to leave in logs.
-# Two runs (premium alone, then premium+render) produced the identical
-# ScraperAPI "protected domain" error either way -- before adding a
-# third parameter blind, need to confirm the modified URL is actually
-# what's being sent, rather than assume it and keep guessing.
-from urllib.parse import urlsplit as _urlsplit
-print(f"DIAGNOSTIC -- proxy username being sent: {_urlsplit(PROXY_URL).username}", flush=True)
-
 DRY_RUN = False
 MATCH_LIMIT = None  # None = process every completed match found, no cap
 
@@ -272,7 +262,13 @@ def get_or_create_player(conn, name, team_id):
     return result[0]
 
 
-def discover_match_reports():
+def fetch_schedule_table():
+    """Single fetch+parse of the schedule page. Previously, sync_fixtures
+    and discover_match_reports each independently fetched this exact
+    same URL -- same page, parsed twice, for two different subsets of
+    the same rows. Confirmed via real ScraperAPI usage data this is
+    genuinely wasteful, not just theoretically: two full ultra_premium
+    requests per day for data that only needs fetching once."""
     html = get_html(FBREF_SCHEDULE_URL)
     if html is None:
         raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
@@ -280,7 +276,10 @@ def discover_match_reports():
     table = find_table_in_comments(soup, "sched")
     if table is None:
         raise RuntimeError("Could not find the schedule table -- FBref's page structure may have changed.")
+    return table
 
+
+def discover_match_reports(table):
     results = []
     for row in table.find("tbody").find_all("tr"):
         if row.get("class") and "thead" in row.get("class"):
@@ -382,19 +381,11 @@ def parse_lineup_section(soup, team_index):
     return starters, bench, formation
 
 
-def discover_all_fixtures():
+def discover_all_fixtures(table):
     """Like discover_match_reports, but captures EVERY fixture on the
     schedule page -- played or not. Needed to pre-populate the matches
     table for a new season, since future fixtures have no report link
     (and therefore no FBref match ID) to key off yet."""
-    html = get_html(FBREF_SCHEDULE_URL)
-    if html is None:
-        raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
-    soup = BeautifulSoup(html, "lxml")
-    table = find_table_in_comments(soup, "sched")
-    if table is None:
-        raise RuntimeError("Could not find the schedule table -- FBref's page structure may have changed.")
-
     fixtures = []
     for row in table.find_all("tr"):
         if row.get("class") and "thead" in row.get("class"):
@@ -419,7 +410,7 @@ def discover_all_fixtures():
     return fixtures
 
 
-def sync_fixtures(conn, teams, season):
+def sync_fixtures(conn, teams, season, table):
     """Ensures every fixture for the season has a matches row, even
     before it's played. Also keeps match_date/matchweek current for
     still-unplayed fixtures -- the Premier League only confirms exact
@@ -428,7 +419,7 @@ def sync_fixtures(conn, teams, season):
     officially fixed closer to the time). The WHERE clause on the update
     restricts this to status='scheduled' rows only, so an already-played
     match's real result can never get overwritten by a stale date."""
-    fixtures = discover_all_fixtures()
+    fixtures = discover_all_fixtures(table)
     created = 0
     updated = 0
     for f in fixtures:
@@ -611,14 +602,17 @@ def process_match(conn, teams, matches, report):
 if __name__ == "__main__":
     teams = teams_map(engine)
 
+    print("Fetching FBref schedule page (used for both fixture sync and match-report discovery)...", flush=True)
+    schedule_table = fetch_schedule_table()
+
     print("Syncing fixture list (creates matches rows for any fixture not yet in the database)...", flush=True)
     with engine.begin() as conn:
-        sync_fixtures(conn, teams, SEASON)
+        sync_fixtures(conn, teams, SEASON, schedule_table)
 
     matches = match_id_map(engine, SEASON)
 
     print("Discovering match reports from FBref schedule page...", flush=True)
-    reports = discover_match_reports()
+    reports = discover_match_reports(schedule_table)
     print(f"Found {len(reports)} completed matches with report links.", flush=True)
 
     if MATCH_LIMIT is not None:
