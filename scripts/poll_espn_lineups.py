@@ -52,7 +52,7 @@ SUMMARY_URL_TMPL = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/s
 
 # SAFETY: dry run first -- prints what it WOULD write without touching
 # the database.
-DRY_RUN = True
+DRY_RUN = False
 
 S = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
