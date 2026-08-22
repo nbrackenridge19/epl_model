@@ -61,7 +61,36 @@ USE_PROXY = True
 # exposure risk once this gets committed to a GitHub repo for Actions to
 # use. Set it the same way as DATABASE_URL:
 #   $env:SCRAPERAPI_PROXY_URL='http://scraperapi:yourkey@proxy-server.scraperapi.com:8001'
-PROXY_URL = os.environ["SCRAPERAPI_PROXY_URL"]
+#
+# ScraperAPI began classifying fbref.com as a "protected domain" as of
+# Aug 2026 -- confirmed via a real 500 response from ScraperAPI itself
+# (not a database or scheduling problem): "Protected domains may require
+# adding premium=true OR ultra_premium=true parameter to your request."
+# _add_premium_param() below adds this automatically, per ScraperAPI's
+# documented proxy-port syntax (the parameter goes in the username,
+# separated by a dot: scraperapi.premium=true) -- no change to the
+# underlying secret needed. If "premium" alone still 500s, set
+# SCRAPERAPI_PREMIUM_LEVEL=ultra_premium as an additional env var (no
+# code change required) -- ultra_premium costs more credits (30x vs 10x
+# per request) so premium is the default, cheaper first try.
+SCRAPERAPI_PREMIUM_LEVEL = os.environ.get("SCRAPERAPI_PREMIUM_LEVEL", "premium")
+
+
+def _add_premium_param(proxy_url, level):
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(proxy_url)
+    username = parts.username or "scraperapi"
+    password = parts.password or ""
+    if f"{level}=true" in username:
+        return proxy_url  # already set -- don't double-append
+    new_username = f"{username}.{level}=true"
+    netloc = f"{new_username}:{password}@{parts.hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+PROXY_URL = _add_premium_param(os.environ["SCRAPERAPI_PROXY_URL"], SCRAPERAPI_PREMIUM_LEVEL)
 
 DRY_RUN = False
 MATCH_LIMIT = None  # None = process every completed match found, no cap
