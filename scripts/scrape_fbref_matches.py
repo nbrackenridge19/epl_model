@@ -378,6 +378,10 @@ def discover_all_fixtures():
     table for a new season, since future fixtures have no report link
     (and therefore no FBref match ID) to key off yet."""
     html = get_html(FBREF_SCHEDULE_URL, render=True)
+    if html is None:
+        raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
+    soup = BeautifulSoup(html, "lxml")
+    table = find_table_in_comments(soup, "sched")
     if table is None:
         raise RuntimeError("Could not find the schedule table -- FBref's page structure may have changed.")
 
