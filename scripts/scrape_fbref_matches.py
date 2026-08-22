@@ -126,8 +126,21 @@ TEAM_NAME_TO_CODE.update({
 })
 
 
-def get_html(url):
-    proxies = {"http": PROXY_URL, "https": PROXY_URL} if USE_PROXY else None
+def get_html(url, render=False):
+    proxy_url = PROXY_URL
+    if render:
+        # Schedule/fixtures page specifically -- error logs show this
+        # exact URL failing with 500s and a 504 (13 retries) even with
+        # premium proxies applied, while the rest of this domain
+        # succeeds ~85% of the time (confirmed via ScraperAPI's own
+        # dashboard). That pattern -- one specific page struggling while
+        # the domain broadly works -- points to this page needing JS
+        # execution to fully load, not a blanket access-tier problem.
+        # Scoped to just this call, not the whole domain: render costs
+        # more credits (25x vs 10x for premium alone), and the
+        # individual match-report pages already work fine without it.
+        proxy_url = _add_premium_param(proxy_url, "render")
+    proxies = {"http": proxy_url, "https": proxy_url} if USE_PROXY else None
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -250,7 +263,7 @@ def get_or_create_player(conn, name, team_id):
 
 
 def discover_match_reports():
-    html = get_html(FBREF_SCHEDULE_URL)
+    html = get_html(FBREF_SCHEDULE_URL, render=True)
     if html is None:
         raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
     soup = BeautifulSoup(html, "lxml")
@@ -364,11 +377,7 @@ def discover_all_fixtures():
     schedule page -- played or not. Needed to pre-populate the matches
     table for a new season, since future fixtures have no report link
     (and therefore no FBref match ID) to key off yet."""
-    html = get_html(FBREF_SCHEDULE_URL)
-    if html is None:
-        raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
-    soup = BeautifulSoup(html, "lxml")
-    table = find_table_in_comments(soup, "sched")
+    html = get_html(FBREF_SCHEDULE_URL, render=True)
     if table is None:
         raise RuntimeError("Could not find the schedule table -- FBref's page structure may have changed.")
 
