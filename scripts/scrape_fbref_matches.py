@@ -273,7 +273,7 @@ def get_or_create_player(conn, name, team_id):
 
 
 def discover_match_reports():
-    html = get_html(FBREF_SCHEDULE_URL, render=True)
+    html = get_html(FBREF_SCHEDULE_URL)
     if html is None:
         raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
     soup = BeautifulSoup(html, "lxml")
@@ -387,7 +387,7 @@ def discover_all_fixtures():
     schedule page -- played or not. Needed to pre-populate the matches
     table for a new season, since future fixtures have no report link
     (and therefore no FBref match ID) to key off yet."""
-    html = get_html(FBREF_SCHEDULE_URL, render=True)
+    html = get_html(FBREF_SCHEDULE_URL)
     if html is None:
         raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
     soup = BeautifulSoup(html, "lxml")
