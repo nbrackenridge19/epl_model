@@ -103,11 +103,29 @@ def merge_into(conn, from_player_id, into_player_id, alias_text):
     now-empty duplicate. Handles the case where the flagged player
     already has predicted_lineups/appearances (created by a live
     scraper under the mismatched name) -- those move to the real,
-    established identity instead of being lost."""
-    conn.execute(text("update predicted_lineups set player_id=:into where player_id=:frm"),
-                 {"into": into_player_id, "frm": from_player_id})
-    conn.execute(text("update player_match_appearances set player_id=:into where player_id=:frm"),
-                 {"into": into_player_id, "frm": from_player_id})
+    established identity instead of being lost.
+
+    Also handles a REAL conflict: if both identities already have a row
+    for the exact same match (e.g. the same match got scraped twice,
+    once under each name, before this merge caught it), the duplicate's
+    row is dropped rather than reassigned -- the target's existing row
+    for that match is kept as-is, never overwritten."""
+    for table in ("predicted_lineups", "player_match_appearances"):
+        conn.execute(
+            text(f"""
+                delete from {table} dup
+                where dup.player_id = :frm
+                and exists (
+                    select 1 from {table} tgt
+                    where tgt.player_id = :into and tgt.match_id = dup.match_id
+                )
+            """),
+            {"frm": from_player_id, "into": into_player_id},
+        )
+        conn.execute(
+            text(f"update {table} set player_id=:into where player_id=:frm"),
+            {"into": into_player_id, "frm": from_player_id},
+        )
     conn.execute(text("delete from player_ratings where player_id=:frm"), {"frm": from_player_id})
     conn.execute(
         text("insert into player_aliases (player_id, alias, source) values (:pid, :alias, 'manual') on conflict do nothing"),
