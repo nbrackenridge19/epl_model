@@ -128,7 +128,7 @@ def get_latest_odds(engine, match_id):
     with engine.connect() as conn:
         row = conn.execute(
             text("""
-                select home_odds, away_odds from odds
+                select home_odds, away_odds, line_type from odds
                 where match_id = :match_id and source = 'espn_draftkings'
                 order by captured_at desc limit 1
             """),
@@ -158,7 +158,7 @@ def moneyline_to_net_odds(ml):
     return ml / 100 if ml > 0 else -100 / ml
 
 
-def evaluate_side(model_prob, ml, bankroll, edge_threshold, games_played):
+def evaluate_side(model_prob, ml, line_type, bankroll, edge_threshold, games_played):
     if model_prob is None:
         return {"status": "no_prediction"}
 
@@ -166,18 +166,27 @@ def evaluate_side(model_prob, ml, bankroll, edge_threshold, games_played):
 
     if games_played < MIN_GAMES_PLAYED:
         return {"status": "too_early", "model_prob": model_prob, "implied_prob": implied_prob,
-                "games_played": games_played}
+                "line_type": line_type, "games_played": games_played}
     if ml is None:
         return {"status": "no_odds", "model_prob": model_prob}
+
+    if line_type != "closing":
+        # Opening line (or a legacy/untyped row) -- illustrative only. The
+        # line can still move before kickoff, so never compute kf/stake
+        # off it; wait for the actual closing snapshot.
+        return {"status": "awaiting_closing", "model_prob": model_prob, "implied_prob": implied_prob,
+                "line_type": line_type}
 
     b = moneyline_to_net_odds(ml)
     kf = model_prob - (1 - model_prob) / b
 
     if edge_threshold is None or kf < edge_threshold * 2:
-        return {"status": "pass", "model_prob": model_prob, "implied_prob": implied_prob, "kf": kf}
+        return {"status": "pass", "model_prob": model_prob, "implied_prob": implied_prob,
+                "line_type": line_type, "kf": kf}
 
     stake = kf * bankroll * KELLY_FRACTION
-    return {"status": "bet", "model_prob": model_prob, "implied_prob": implied_prob, "kf": kf, "stake": stake}
+    return {"status": "bet", "model_prob": model_prob, "implied_prob": implied_prob,
+            "line_type": line_type, "kf": kf, "stake": stake}
 
 
 def record_bet(conn, match_id, team_id, evaluation):
@@ -199,11 +208,18 @@ def render_html(bankroll, model_version, results):
     rows_html = ""
     for r in results:
         badge = {"bet": "BET", "pass": "pass", "too_early": "too early",
+                 "awaiting_closing": "awaiting closing line",
                  "no_odds": "no odds yet", "no_prediction": "no lineup yet"}[r["status"]]
         badge_color = {"bet": "#1a7f37", "pass": "#666", "too_early": "#999",
+                       "awaiting_closing": "#b8860b",
                        "no_odds": "#999", "no_prediction": "#999"}[r["status"]]
         model_pct = f"{r['model_prob']:.1%}" if r.get("model_prob") is not None else "-"
-        market_pct = f"{r['implied_prob']:.1%}" if r.get("implied_prob") is not None else "-"
+        if r.get("implied_prob") is not None:
+            market_pct = f"{r['implied_prob']:.1%}"
+            if r.get("line_type"):
+                market_pct += f" <span class=\"line-tag\">({r['line_type']})</span>"
+        else:
+            market_pct = "-"
         stake_str = f"${r['stake']:.2f}" if r["status"] == "bet" else "-"
         rows_html += (
             "<tr>"
@@ -225,6 +241,7 @@ def render_html(bankroll, model_version, results):
         "overflow: hidden; } "
         "th, td { padding: 10px 8px; text-align: left; font-size: 14px; border-bottom: 1px solid #eee; } "
         "th { background: #f0f0f0; font-size: 12px; text-transform: uppercase; } "
+        ".line-tag { color: #999; font-size: 11px; } "
         "@media (max-width: 480px) { th, td { font-size: 12px; padding: 8px 4px; } }"
     )
 
@@ -259,7 +276,7 @@ if __name__ == "__main__":
         for m in matches:
             match_id, match_date, home_code, away_code, home_id, away_id = m
             odds = get_latest_odds(engine, match_id)
-            home_ml, away_ml = odds if odds else (None, None)
+            home_ml, away_ml, line_type = odds if odds else (None, None, None)
 
             for team_id, team_code, ml, is_home in [
                 (home_id, home_code, home_ml, True), (away_id, away_code, away_ml, False)
@@ -267,7 +284,7 @@ if __name__ == "__main__":
                 features = get_match_features(engine, match_id, team_id)
                 model_prob = compute_probability(coefs, team_code, features) if features else None
                 games_played = get_games_played(engine, team_id, match_date)
-                evaluation = evaluate_side(model_prob, ml, bankroll, edge_threshold, games_played)
+                evaluation = evaluate_side(model_prob, ml, line_type, bankroll, edge_threshold, games_played)
                 evaluation.update({"match_date": match_date, "team_code": team_code, "is_home": is_home})
                 results.append(evaluation)
 

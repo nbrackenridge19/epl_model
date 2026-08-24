@@ -241,14 +241,15 @@ def process_game(conn, teams, matches, game):
         print(f"  {game['home_team']} vs {game['away_team']}: no DraftKings odds posted yet", flush=True)
         return
 
+    tag = "closing" if is_closing_window else "opening"
     conn.execute(
         text("""
-            insert into odds (match_id, source, market, home_odds, away_odds, draw_odds, captured_at)
-            values (:match_id, 'espn_draftkings', 'moneyline', :home_odds, :away_odds, :draw_odds, now())
+            insert into odds (match_id, source, market, home_odds, away_odds, draw_odds, captured_at, line_type)
+            values (:match_id, 'espn_draftkings', 'moneyline', :home_odds, :away_odds, :draw_odds, now(), :line_type)
         """),
-        {"match_id": match_id, "home_odds": home_ml, "away_odds": away_ml, "draw_odds": draw_ml},
+        {"match_id": match_id, "home_odds": home_ml, "away_odds": away_ml, "draw_odds": draw_ml,
+         "line_type": tag},
     )
-    tag = "closing" if is_closing_window else "opening"
     print(f"  wrote {tag} odds: {game['home_team']} ({home_ml}) vs {game['away_team']} ({away_ml}), draw ({draw_ml})", flush=True)
 
 
