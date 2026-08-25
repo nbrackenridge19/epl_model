@@ -269,7 +269,7 @@ def fetch_schedule_table():
     the same rows. Confirmed via real ScraperAPI usage data this is
     genuinely wasteful, not just theoretically: two full ultra_premium
     requests per day for data that only needs fetching once."""
-    html = get_html(FBREF_SCHEDULE_URL)
+    html = get_html(FBREF_SCHEDULE_URL, render=True)
     if html is None:
         raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
     soup = BeautifulSoup(html, "lxml")
