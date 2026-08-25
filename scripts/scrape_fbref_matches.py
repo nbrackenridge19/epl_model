@@ -92,6 +92,16 @@ def _add_premium_param(proxy_url, level):
 
 PROXY_URL = _add_premium_param(os.environ["SCRAPERAPI_PROXY_URL"], SCRAPERAPI_PREMIUM_LEVEL)
 
+# TEMPORARY DIAGNOSTIC -- remove once the render+premium failure is
+# resolved. Prints ONLY the username/parameter portion of the proxy URL
+# (never the password/API key), so this is safe to leave in Actions logs.
+# Confirms exactly what ScraperAPI parameter string is being sent for
+# the base proxy, before the render-only bump is layered on top in
+# get_html() for the schedule page specifically.
+from urllib.parse import urlsplit as _urlsplit
+print(f"DIAGNOSTIC -- base proxy username being sent: {_urlsplit(PROXY_URL).username}", flush=True)
+print(f"DIAGNOSTIC -- SCRAPERAPI_PREMIUM_LEVEL env value: {SCRAPERAPI_PREMIUM_LEVEL!r}", flush=True)
+
 DRY_RUN = False
 MATCH_LIMIT = None  # None = process every completed match found, no cap
 
@@ -140,6 +150,10 @@ def get_html(url, render=False):
         # more credits (25x vs 10x for premium alone), and the
         # individual match-report pages already work fine without it.
         proxy_url = _add_premium_param(proxy_url, "render")
+        # TEMPORARY DIAGNOSTIC -- same rationale as above, scoped to the
+        # render branch so we see the fully-chained username (tier +
+        # render) exactly as sent for the schedule-page request.
+        print(f"   DIAGNOSTIC -- render-branch proxy username: {_urlsplit(proxy_url).username}", flush=True)
     proxies = {"http": proxy_url, "https": proxy_url} if USE_PROXY else None
     headers = {
         "User-Agent": (
