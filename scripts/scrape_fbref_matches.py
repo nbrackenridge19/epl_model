@@ -126,8 +126,18 @@ TEAM_NAME_TO_CODE.update({
 })
 
 
-def get_html(url, render=False):
-    proxy_url = PROXY_URL
+def get_html(url, render=False, use_premium=True):
+    # use_premium=False sends the request through the base proxy with NO
+    # premium/ultra_premium param at all. Confirmed via ScraperAPI's own
+    # support test (Aug 2026) that a plain standard-tier request against
+    # the fbref schedule URL returns a clean 200 -- consistent with the
+    # domain-report data showing no-flag requests succeeding ~85% of the
+    # time on fbref.com, actually higher than ultra_premium alone (~65%).
+    # ultra_premium's sudden 0% success rate the same day remains
+    # unexplained (ticket open with ScraperAPI), but dropping it here
+    # both sidesteps the current block and is far cheaper (1 credit vs
+    # 30) regardless of how that ticket resolves.
+    proxy_url = PROXY_URL if use_premium else os.environ["SCRAPERAPI_PROXY_URL"]
     if render:
         # NOTE (confirmed via ScraperAPI's domain-report data, Aug 2026):
         # render=true against fbref.com has a 0% success rate across every
@@ -269,7 +279,7 @@ def fetch_schedule_table():
     the same rows. Confirmed via real ScraperAPI usage data this is
     genuinely wasteful, not just theoretically: two full ultra_premium
     requests per day for data that only needs fetching once."""
-    html = get_html(FBREF_SCHEDULE_URL)
+    html = get_html(FBREF_SCHEDULE_URL, use_premium=False)
     if html is None:
         raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
     soup = BeautifulSoup(html, "lxml")
