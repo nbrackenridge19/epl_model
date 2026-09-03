@@ -14,6 +14,11 @@ epl2526.xlsx file, not assumed):
     5 gameweeks," giving rolling features real time to stabilize).
   - stake = kf * current_bankroll * 0.15 (the spreadsheet's own
     conservative fraction -- 15% of full Kelly, not half or quarter).
+  - Only bet if the model's predicted probability falls in [0.3, 0.7]
+    (PROB_BAND_LOW/HIGH below). Historical validation showed this
+    roughly triples profit and is profitable in 6/6 seasons, but a
+    formal significance test didn't clear the conventional bar (p=0.07)
+    -- shipping this as a deliberate decision, not a proven edge.
 
 Current bankroll is computed dynamically: 2025-26's actual ending
 bankroll ($2,176.93, computed directly from the real historical data,
@@ -31,15 +36,19 @@ on the same schedule as the odds/lineup scrapers, regenerating whenever
 fresh data might be available.
 
 SETUP:
-    pip install sqlalchemy psycopg2-binary --break-system-packages
+    pip install sqlalchemy psycopg2-binary patsy --break-system-packages
+    (patsy added 2026-09-03 -- needed to reconstruct the strtD spline
+    basis at prediction time; see compute_probability/spline_basis)
 
 Set DATABASE_URL the same way as the other scripts.
 """
 
 import os
 import math
+import json
 from datetime import date
 
+import patsy
 from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -51,11 +60,22 @@ MIN_GAMES_PLAYED = 5
 STARTING_BANKROLL = 2176.93  # 2025-26's real ending bankroll -- see conversation for how this was derived
 OUTPUT_PATH = "docs/index.html"  # GitHub Pages serves from /docs by default
 
+# Betting eligibility restriction (added 2026-09-03): only bet when the
+# model's own predicted probability falls in this band. Historical
+# validation (bootstrap/permutation/leave-out) roughly tripled profit and
+# was profitable in 6/6 seasons, but did NOT clear a conventional
+# significance bar (p=0.07) -- profit is concentrated in a handful of
+# underdog wins. Shipping anyway per explicit decision, not because the
+# edge is proven durable. Revisit if live results diverge badly from the
+# historical pattern.
+PROB_BAND_LOW = 0.3
+PROB_BAND_HIGH = 0.7
+
 
 def get_latest_model(engine):
     with engine.connect() as conn:
         version = conn.execute(
-            text("""select id, fit_date, min_edge_threshold, notes
+            text("""select id, fit_date, min_edge_threshold, spline_config, notes
                      from model_versions order by fit_date desc limit 1""")
         ).fetchone()
         if version is None:
@@ -271,7 +291,30 @@ def get_latest_odds(engine, match_id):
     return row
 
 
-def compute_probability(coefs, team_code, features):
+def spline_basis(value, knots, degree=3, lower_bound=None, upper_bound=None):
+    """Reconstructs the exact same B-spline basis patsy produced at fit
+    time for a single raw value, using the knot locations (and explicit
+    boundary knots) stored in model_versions.spline_config. Must stay in
+    lockstep with fit_model.py's build_formula -- same knots, same
+    bounds, same degree, include_intercept=False -- or the basis won't
+    match the stored coefficients.
+
+    lower_bound/upper_bound MUST be passed and must be the training
+    data's actual min/max: patsy's bs() infers boundary knots from
+    whatever data it's given, and a single live value has no "range" of
+    its own to infer from -- without an explicit bound this raises a
+    ValueError the instant a live value falls outside the guessed range.
+    A live match's strtD more extreme than anything in training data is
+    clipped into range rather than crashing the whole dashboard run."""
+    if lower_bound is not None and upper_bound is not None:
+        value = min(max(value, lower_bound), upper_bound)
+    formula = (f"bs(x, knots={knots!r}, degree={degree}, "
+               f"lower_bound={lower_bound!r}, upper_bound={upper_bound!r}, include_intercept=False) - 1")
+    design = patsy.dmatrix(formula, {"x": [value]})
+    return list(design[0])
+
+
+def compute_probability(coefs, team_code, features, spline_config=None):
     # Cast every value to float explicitly. Postgres NUMERIC columns
     # come back as Decimal via SQLAlchemy, and the 9 named features
     # below stay Decimal-consistent throughout (Decimal coefficient *
@@ -282,10 +325,20 @@ def compute_probability(coefs, team_code, features):
     # TypeError. Casting everything to float up front avoids this
     # regardless of what type any individual value happens to be.
     logit = float(coefs.get("Intercept", 0.0))
+    spline_config = spline_config or {}
     names = ["avgatt", "xgfpgd", "xgapgd", "gkpgd", "possd", "strtd", "bertd", "stmsd", "formcd"]
     for name, value in zip(names, features):
         if value is None:
             return None
+        if name == "possd":
+            continue  # tracked descriptively but not part of the regression formula
+        if name in spline_config:
+            cfg = spline_config[name]
+            basis_values = spline_basis(float(value), cfg["knots"], cfg.get("degree", 3),
+                                         cfg.get("lower_bound"), cfg.get("upper_bound"))
+            for i, bv in enumerate(basis_values):
+                logit += float(coefs.get(f"{name}_bs{i}", 0.0)) * bv
+            continue
         logit += float(coefs.get(name, 0.0)) * float(value)
     logit += float(coefs.get(f"C(team_code)[T.{team_code}]", 0.0))
     return 1 / (1 + math.exp(-logit))
@@ -318,6 +371,13 @@ def evaluate_side(model_prob, ml, line_type, bankroll, edge_threshold, games_pla
         # line can still move before kickoff, so never compute kf/stake
         # off it; wait for the actual closing snapshot.
         return {"status": "awaiting_closing", "model_prob": model_prob, "implied_prob": implied_prob,
+                "line_type": line_type, "moneyline": ml}
+
+    if not (PROB_BAND_LOW <= model_prob <= PROB_BAND_HIGH):
+        # Outside the validated betting band -- see PROB_BAND_LOW/HIGH
+        # comment at top of file. Model still considered this and passed,
+        # same as a below-edge-threshold "pass".
+        return {"status": "outside_prob_band", "model_prob": model_prob, "implied_prob": implied_prob,
                 "line_type": line_type, "moneyline": ml}
 
     b = moneyline_to_net_odds(ml)
@@ -433,9 +493,11 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
     for r in results:
         badge = {"bet": "BET", "pass": "pass", "too_early": "too early",
                  "awaiting_closing": "awaiting closing line",
+                 "outside_prob_band": "outside betting band",
                  "no_odds": "no odds yet", "no_prediction": "no lineup yet"}[r["status"]]
         badge_color = {"bet": "#1a7f37", "pass": "#666", "too_early": "#999",
                        "awaiting_closing": "#b8860b",
+                       "outside_prob_band": "#999",
                        "no_odds": "#999", "no_prediction": "#999"}[r["status"]]
         model_pct = f"{r['model_prob']:.1%}" if r.get("model_prob") is not None else "-"
         if r.get("implied_prob") is not None:
@@ -575,6 +637,9 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
 if __name__ == "__main__":
     version, coefs = get_latest_model(engine)
     edge_threshold = version[2]
+    spline_config = version[3] or {}
+    if isinstance(spline_config, str):  # psycopg2 usually auto-parses jsonb, but be defensive
+        spline_config = json.loads(spline_config)
     bankroll = get_current_bankroll(engine)
     print(f"Current bankroll: ${bankroll:,.2f}")
     print(f"Using model fit {version[1]}, edge threshold {edge_threshold}")
@@ -596,7 +661,7 @@ if __name__ == "__main__":
                 (home_id, home_code, home_ml, True), (away_id, away_code, away_ml, False)
             ]:
                 features = get_match_features(engine, match_id, team_id)
-                model_prob = compute_probability(coefs, team_code, features) if features else None
+                model_prob = compute_probability(coefs, team_code, features, spline_config) if features else None
                 games_played = get_games_played(engine, team_id, match_date)
                 evaluation = evaluate_side(model_prob, ml, line_type, bankroll, edge_threshold, games_played)
                 evaluation.update({
@@ -605,7 +670,7 @@ if __name__ == "__main__":
                 })
                 results.append(evaluation)
 
-                if evaluation["status"] in ("bet", "pass"):
+                if evaluation["status"] in ("bet", "pass", "outside_prob_band"):
                     record_bet(conn, match_id, team_id, evaluation)
 
     settled_bets = get_settled_bets(engine)
