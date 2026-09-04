@@ -412,86 +412,130 @@ def record_bet(conn, match_id, team_id, evaluation):
     )
 
 
-def get_completed_match_results(engine):
-    """Every completed match this season, from BOTH teams' perspective,
-    LEFT JOINed to whatever bets row (if any) the model produced for that
-    team/match. Deliberately not scoped to bets rows -- a match the
-    pipeline never got to evaluate at all (e.g. a failed lineup poll,
-    same class of gap as the get_candidate_matches fix) should still
-    show its real result here instead of silently not existing."""
+def get_completed_match_results(engine, coefs, spline_config):
+    """Every completed match this season, both team perspectives. Model %
+    and Market % are ALWAYS recomputed live -- current model coefficients
+    against v_match_model_features_predicted, and the latest odds row --
+    exactly like the Today's Matches loop does for upcoming games, rather
+    than read from any persisted bets row. That means it reflects the
+    CURRENT model's read on every match regardless of whether it was ever
+    actually bet on, evaluated, or even reached by the pipeline live
+    (deliberate choice, not a bug: there's no live-prediction snapshot to
+    fall back to for a match the pipeline skipped). Wager amount and bet
+    result are the one piece pulled from `bets`, since that's real
+    financial history that can't be recomputed after the fact."""
     with engine.connect() as conn:
-        rows = conn.execute(
+        matches = conn.execute(
             text("""
-                select m.matchweek, m.match_date, t.code as team_code,
-                       (m.home_team_id = t.id) as is_home, m.home_goals, m.away_goals,
-                       b.predicted_prob, b.odds_used, b.stake, b.profit
+                select m.id, m.matchweek, m.match_date, ht.code as home_code, at.code as away_code,
+                       ht.id as home_id, at.id as away_id, m.home_goals, m.away_goals
                 from matches m
-                join teams t on t.id in (m.home_team_id, m.away_team_id)
-                left join bets b on b.match_id = m.id and b.team_id = t.id
+                join teams ht on ht.id = m.home_team_id
+                join teams at on at.id = m.away_team_id
                 where m.season = :season and m.status = 'completed'
                 order by m.matchweek desc, m.match_date desc
             """),
             {"season": SEASON},
         ).fetchall()
-    return rows
+        bet_rows = conn.execute(
+            text("""
+                select b.match_id, b.team_id, b.stake, b.outcome, b.profit
+                from bets b join matches m on m.id = b.match_id
+                where m.season = :season
+            """),
+            {"season": SEASON},
+        ).fetchall()
+    bets_by_match_team = {(mid, tid): (float(stake or 0), outcome, float(profit) if profit is not None else None)
+                           for mid, tid, stake, outcome, profit in bet_rows}
 
-
-def summarize_by_matchweek(match_results):
-    """Groups completed match/team instances by matchweek for the
-    dashboard's drill-down Results section. Win%/wagered/profit/return
-    are computed over PLACED bets only (stake > 0 in a real bets row).
-    LogLoss/market LogLoss are computed over every instance that has a
-    stored predicted_prob/odds_used (i.e. was actually evaluated),
-    matching the same convention used elsewhere. The team's actual
-    match result (won/drew/lost, real score) is computed independently
-    from home_goals/away_goals, so it displays correctly even for
-    instances the model never evaluated at all."""
-    by_mw = {}
-    for matchweek, match_date, team_code, is_home, home_goals, away_goals, predicted_prob, odds_used, stake, profit in match_results:
+    instances = []
+    for match_id, matchweek, match_date, home_code, away_code, home_id, away_id, home_goals, away_goals in matches:
         if home_goals is None or away_goals is None:
             continue  # marked completed but scores not in yet -- shouldn't normally happen
-        team_goals = home_goals if is_home else away_goals
-        opp_goals = away_goals if is_home else home_goals
-        result = "won" if team_goals > opp_goals else ("drew" if team_goals == opp_goals else "lost")
-        by_mw.setdefault(matchweek, []).append({
-            "match_date": match_date, "team_code": team_code, "is_home": is_home,
-            "score": f"{team_goals}-{opp_goals}", "result": result,
-            "predicted_prob": float(predicted_prob) if predicted_prob is not None else None,
-            "odds_used": float(odds_used) if odds_used is not None else None,
-            "stake": float(stake) if stake is not None else 0.0,
-            "evaluated": stake is not None,  # False only when no bets row exists at all
-            "profit": float(profit) if profit is not None else 0.0,
-        })
+        odds = get_latest_odds(engine, match_id)
+        home_ml, away_ml, line_type = odds if odds else (None, None, None)
+
+        for team_id, team_code, ml, is_home in [
+            (home_id, home_code, home_ml, True), (away_id, away_code, away_ml, False)
+        ]:
+            features = get_match_features(engine, match_id, team_id)
+            model_prob = compute_probability(coefs, team_code, features, spline_config) if features else None
+            market_prob = moneyline_to_implied_prob(ml)
+            team_goals = home_goals if is_home else away_goals
+            opp_goals = away_goals if is_home else home_goals
+            result = "won" if team_goals > opp_goals else ("drew" if team_goals == opp_goals else "lost")
+            stake, bet_outcome, profit = bets_by_match_team.get((match_id, team_id), (0.0, None, None))
+            instances.append({
+                "match_id": match_id, "matchweek": matchweek, "match_date": match_date,
+                "team_code": team_code, "is_home": is_home, "score": f"{team_goals}-{opp_goals}",
+                "result": result, "model_prob": model_prob, "market_prob": market_prob,
+                "stake": stake, "bet_outcome": bet_outcome, "profit": profit,
+            })
+    return instances
+
+
+def summarize_by_matchweek(instances):
+    """Groups completed match instances by matchweek for the dashboard's
+    drill-down Results section. 'Model correct'/'Market correct' are
+    MATCH-level (not per-team-instance): for each match, whichever side
+    has the higher model_prob (resp. market_prob) is that predictor's
+    pick, and it's correct if that side actually won (a draw counts
+    against whichever side was picked, matching moneyline settlement
+    convention used everywhere else). Wagered/profit/return are summed
+    over real placed bets (stake > 0) only. LogLoss/market LogLoss are
+    computed over every team-instance with a usable probability."""
+    by_mw = {}
+    for x in instances:
+        by_mw.setdefault(x["matchweek"], {}).setdefault(x["match_id"], []).append(x)
 
     summaries = []
     for mw in sorted(by_mw, reverse=True):
-        instances = by_mw[mw]
-        placed = [x for x in instances if x["stake"] > 0]
-        wins = sum(1 for x in placed if x["result"] == "won")
-        losses = sum(1 for x in placed if x["result"] != "won")  # moneyline: draw settles as a loss
-        total_profit = sum(x["profit"] for x in placed)
-        total_wagered = sum(x["stake"] for x in placed)
-        return_pct = (total_profit / total_wagered) if total_wagered else None
-
+        matches_in_mw = by_mw[mw]
+        model_correct = model_evaluated = 0
+        market_correct = market_evaluated = 0
+        total_wagered = total_profit = 0.0
         model_losses, market_losses = [], []
-        for x in instances:
+        all_instances = []
+
+        for match_id, sides in matches_in_mw.items():
+            all_instances.extend(sides)
+            home = next((s for s in sides if s["is_home"]), None)
+            away = next((s for s in sides if not s["is_home"]), None)
+            if home and away:
+                if home["model_prob"] is not None and away["model_prob"] is not None:
+                    model_evaluated += 1
+                    picked = home if home["model_prob"] >= away["model_prob"] else away
+                    if picked["result"] == "won":
+                        model_correct += 1
+                if home["market_prob"] is not None and away["market_prob"] is not None:
+                    market_evaluated += 1
+                    picked = home if home["market_prob"] >= away["market_prob"] else away
+                    if picked["result"] == "won":
+                        market_correct += 1
+
+        for x in all_instances:
+            if x["stake"] and x["stake"] > 0:
+                total_wagered += x["stake"]
+                total_profit += x["profit"] or 0.0  # None here means placed but not yet settled
+
             y = 1.0 if x["result"] == "won" else 0.0
-            p = x["predicted_prob"]
+            p = x["model_prob"]
             if p is not None and 0 < p < 1:
                 model_losses.append(-(y * math.log(p) + (1 - y) * math.log(1 - p)))
-            ml = x["odds_used"]
-            if ml is not None:
-                implied = moneyline_to_implied_prob(ml)
-                if implied is not None and 0 < implied < 1:
-                    market_losses.append(-(y * math.log(implied) + (1 - y) * math.log(1 - implied)))
+            ml_prob = x["market_prob"]
+            if ml_prob is not None and 0 < ml_prob < 1:
+                market_losses.append(-(y * math.log(ml_prob) + (1 - y) * math.log(1 - ml_prob)))
         model_logloss = sum(model_losses) / len(model_losses) if model_losses else None
         market_logloss = sum(market_losses) / len(market_losses) if market_losses else None
+        return_pct = (total_profit / total_wagered) if total_wagered else None
 
         summaries.append({
-            "matchweek": mw, "bets_placed": len(placed), "wins": wins, "losses": losses,
+            "matchweek": mw, "n_matches": len(matches_in_mw),
+            "model_correct": model_correct, "model_evaluated": model_evaluated,
+            "market_correct": market_correct, "market_evaluated": market_evaluated,
             "total_profit": total_profit, "total_wagered": total_wagered, "return_pct": return_pct,
             "model_logloss": model_logloss, "market_logloss": market_logloss,
-            "instances": sorted(instances, key=lambda x: (x["match_date"], x["team_code"])),
+            "instances": sorted(all_instances, key=lambda x: (x["match_date"], x["team_code"])),
         })
     return summaries
 
@@ -572,7 +616,8 @@ def render_html(bankroll, model_version, results, match_results, season_summarie
     matchweek_summaries = summarize_by_matchweek(match_results)
     mw_html = ""
     for mw in matchweek_summaries:
-        win_pct = f"{mw['wins']}-{mw['losses']} ({mw['wins'] / mw['bets_placed']:.0%})" if mw['bets_placed'] else "no bets"
+        model_str = f"Model {mw['model_correct']}/{mw['model_evaluated']}" if mw['model_evaluated'] else "Model -"
+        market_str = f"Mkt {mw['market_correct']}/{mw['market_evaluated']}" if mw['market_evaluated'] else "Mkt -"
         profit_str = f"{'+' if mw['total_profit'] >= 0 else ''}${mw['total_profit']:,.2f}"
         profit_color = "#1a7f37" if mw['total_profit'] >= 0 else "#c0392b"
         return_str = f"{mw['return_pct']:+.1%}" if mw['return_pct'] is not None else "-"
@@ -581,23 +626,28 @@ def render_html(bankroll, model_version, results, match_results, season_summarie
 
         detail_rows = ""
         for x in mw["instances"]:
-            result_label = {"won": "WON", "drew": "DREW", "lost": "lost"}[x["result"]]
-            result_color = "#1a7f37" if x["result"] == "won" else ("#b8860b" if x["result"] == "drew" else "#c0392b")
+            model_pct = f"{x['model_prob']:.1%}" if x['model_prob'] is not None else "-"
+            market_pct = f"{x['market_prob']:.1%}" if x['market_prob'] is not None else "-"
             if x["stake"] and x["stake"] > 0:
-                bet_str = f"${x['stake']:.2f}"
-                row_profit_str = f"{'+' if x['profit'] >= 0 else ''}${x['profit']:.2f}"
-            elif x["evaluated"]:
-                bet_str, row_profit_str = "passed", "-"
+                wager_str = f"${x['stake']:.2f}"
+                if x["bet_outcome"] == "win":
+                    bet_result_str, bet_result_color = "WON", "#1a7f37"
+                elif x["bet_outcome"] == "loss":
+                    bet_result_str, bet_result_color = "lost", "#c0392b"
+                else:
+                    bet_result_str, bet_result_color = "pending", "#b8860b"  # placed but not yet settled
             else:
-                bet_str, row_profit_str = "not evaluated", "-"
+                wager_str, bet_result_str, bet_result_color = "$0.00", "-", "#999"
             detail_rows += (
                 "<tr>"
                 f"<td>{x['match_date']}</td>"
+                f"<td class=\"mono\" title=\"{x['match_id']}\">{str(x['match_id'])[:8]}</td>"
                 f"<td>{x['team_code'].upper()} {'(H)' if x['is_home'] else '(A)'}</td>"
                 f"<td>{x['score']}</td>"
-                f"<td><span style=\"color:{result_color}; font-weight:600;\">{result_label}</span></td>"
-                f"<td>{bet_str}</td>"
-                f"<td>{row_profit_str}</td>"
+                f"<td>{model_pct}</td>"
+                f"<td>{market_pct}</td>"
+                f"<td>{wager_str}</td>"
+                f"<td><span style=\"color:{bet_result_color}; font-weight:600;\">{bet_result_str}</span></td>"
                 "</tr>"
             )
 
@@ -605,13 +655,15 @@ def render_html(bankroll, model_version, results, match_results, season_summarie
             "<details class=\"mw-block\">"
             "<summary>"
             f"<span class=\"mw-title\">Matchweek {mw['matchweek']}</span>"
-            f"<span class=\"mw-stat\">{win_pct}</span>"
+            f"<span class=\"mw-stat\">{model_str} correct</span>"
+            f"<span class=\"mw-stat\">{market_str} correct</span>"
             f"<span class=\"mw-stat\">${mw['total_wagered']:,.2f} wagered</span>"
             f"<span class=\"mw-stat\" style=\"color:{profit_color}; font-weight:600;\">{profit_str}</span>"
             f"<span class=\"mw-stat\">{return_str} return</span>"
             f"<span class=\"mw-stat\">LL {model_ll} / {market_ll}</span>"
             "</summary>"
-            "<table class=\"mw-detail\"><tr><th>Date</th><th>Team</th><th>Score</th><th>Result</th><th>Bet</th><th>Profit</th></tr>"
+            "<table class=\"mw-detail\"><tr><th>Date</th><th>Match ID</th><th>Team</th><th>Score</th>"
+            "<th>Model %</th><th>Market %</th><th>Wager</th><th>Bet Result</th></tr>"
             f"{detail_rows}</table>"
             "</details>"
         )
@@ -634,6 +686,7 @@ def render_html(bankroll, model_version, results, match_results, season_summarie
         ".mw-block[open] summary::before { content: '\\25BE'; } "
         ".mw-title { font-weight: 700; font-size: 14px; margin-right: 4px; } "
         ".mw-stat { color: #444; } "
+        ".mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #888; } "
         "table.mw-detail { border-radius: 0; margin: 0; box-shadow: none; } "
         "table.mw-detail th, table.mw-detail td { padding: 8px; } "
         "@media (max-width: 480px) { th, td { font-size: 12px; padding: 8px 4px; } }"
@@ -811,7 +864,7 @@ if __name__ == "__main__":
                 if evaluation["status"] in ("bet", "pass", "outside_prob_band"):
                     record_bet(conn, match_id, team_id, evaluation)
 
-    match_results = get_completed_match_results(engine)
+    match_results = get_completed_match_results(engine, coefs, spline_config)
     print(f"Found {len(match_results)} completed match/team instances to show in Results.")
 
     season_summaries = get_season_summaries(engine)
