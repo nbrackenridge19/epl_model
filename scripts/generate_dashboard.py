@@ -46,7 +46,7 @@ Set DATABASE_URL the same way as the other scripts.
 import os
 import math
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 
 import patsy
 from sqlalchemy import create_engine, text
@@ -415,18 +415,66 @@ def get_settled_bets(engine):
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
-                select m.match_date, t.code as team_code, (m.home_team_id = b.team_id) as is_home,
+                select m.matchweek, m.match_date, t.code as team_code, (m.home_team_id = b.team_id) as is_home,
                        b.predicted_prob, b.odds_used, b.stake, b.outcome, b.profit, b.bankroll_after
                 from bets b
                 join matches m on m.id = b.match_id
                 join teams t on t.id = b.team_id
                 where m.season = :season and b.outcome is not null
-                order by m.match_date desc, b.stake desc
-                limit 100
+                order by m.matchweek desc, m.match_date desc, b.stake desc
             """),
             {"season": SEASON},
         ).fetchall()
     return rows
+
+
+def summarize_by_matchweek(settled_bets):
+    """Groups settled bet/pass instances by matchweek for the dashboard's
+    drill-down Results section. Win%/wagered/profit/return are computed
+    over PLACED bets only (stake > 0) -- those are the only rows with a
+    real financial outcome. LogLoss/market LogLoss follow the same
+    convention as get_season_summaries: computed over EVERY evaluated
+    instance (bet AND pass), since that's a model-calibration metric,
+    not a betting-outcome one."""
+    by_mw = {}
+    for matchweek, match_date, team_code, is_home, predicted_prob, odds_used, stake, outcome, profit, bankroll_after in settled_bets:
+        by_mw.setdefault(matchweek, []).append({
+            "match_date": match_date, "team_code": team_code, "is_home": is_home,
+            "predicted_prob": predicted_prob, "odds_used": odds_used, "stake": stake or 0,
+            "outcome": outcome, "profit": profit or 0,
+        })
+
+    summaries = []
+    for mw in sorted(by_mw, reverse=True):
+        instances = by_mw[mw]
+        placed = [x for x in instances if x["stake"] > 0]
+        wins = sum(1 for x in placed if x["outcome"] == "win")
+        losses = sum(1 for x in placed if x["outcome"] == "loss")
+        total_profit = sum(x["profit"] for x in placed)
+        total_wagered = sum(x["stake"] for x in placed)
+        return_pct = (total_profit / total_wagered) if total_wagered else None
+
+        model_losses, market_losses = [], []
+        for x in instances:
+            y = 1.0 if x["outcome"] == "win" else 0.0
+            p = x["predicted_prob"]
+            if p is not None and 0 < p < 1:
+                model_losses.append(-(y * math.log(p) + (1 - y) * math.log(1 - p)))
+            ml = x["odds_used"]
+            if ml is not None:
+                implied = moneyline_to_implied_prob(ml)
+                if implied is not None and 0 < implied < 1:
+                    market_losses.append(-(y * math.log(implied) + (1 - y) * math.log(1 - implied)))
+        model_logloss = sum(model_losses) / len(model_losses) if model_losses else None
+        market_logloss = sum(market_losses) / len(market_losses) if market_losses else None
+
+        summaries.append({
+            "matchweek": mw, "bets_placed": len(placed), "wins": wins, "losses": losses,
+            "total_profit": total_profit, "total_wagered": total_wagered, "return_pct": return_pct,
+            "model_logloss": model_logloss, "market_logloss": market_logloss,
+            "instances": sorted(instances, key=lambda x: (x["match_date"], x["team_code"])),
+        })
+    return summaries
 
 
 def get_season_summaries(engine):
@@ -502,24 +550,48 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
             "</tr>"
         )
 
-    history_rows_html = ""
-    for h in settled_bets:
-        match_date, team_code, is_home, predicted_prob, odds_used, stake, outcome, profit, bankroll_after = h
-        if stake and stake > 0:
-            result_str = "WON" if outcome == "win" else "lost"
-            result_color = "#1a7f37" if outcome == "win" else "#c0392b"
-            stake_str = f"${stake:.2f}"
-            profit_str = f"{'+' if profit >= 0 else ''}${profit:.2f}"
-        else:
-            result_str, result_color, stake_str, profit_str = "passed", "#999", "-", "-"
-        history_rows_html += (
-            "<tr>"
-            f"<td>{match_date}</td>"
-            f"<td>{team_code.upper()} {'(H)' if is_home else '(A)'}</td>"
-            f"<td>{stake_str}</td>"
-            f"<td><span style=\"color:{result_color}; font-weight:600;\">{result_str}</span></td>"
-            f"<td>{profit_str}</td>"
-            "</tr>"
+    matchweek_summaries = summarize_by_matchweek(settled_bets)
+    mw_html = ""
+    for mw in matchweek_summaries:
+        win_pct = f"{mw['wins']}-{mw['losses']} ({mw['wins'] / mw['bets_placed']:.0%})" if mw['bets_placed'] else "no bets"
+        profit_str = f"{'+' if mw['total_profit'] >= 0 else ''}${mw['total_profit']:,.2f}"
+        profit_color = "#1a7f37" if mw['total_profit'] >= 0 else "#c0392b"
+        return_str = f"{mw['return_pct']:+.1%}" if mw['return_pct'] is not None else "-"
+        model_ll = f"{mw['model_logloss']:.3f}" if mw['model_logloss'] is not None else "-"
+        market_ll = f"{mw['market_logloss']:.3f}" if mw['market_logloss'] is not None else "-"
+
+        detail_rows = ""
+        for x in mw["instances"]:
+            if x["stake"] and x["stake"] > 0:
+                result_str = "WON" if x["outcome"] == "win" else "lost"
+                result_color = "#1a7f37" if x["outcome"] == "win" else "#c0392b"
+                stake_str = f"${x['stake']:.2f}"
+                row_profit_str = f"{'+' if x['profit'] >= 0 else ''}${x['profit']:.2f}"
+            else:
+                result_str, result_color, stake_str, row_profit_str = "passed", "#999", "-", "-"
+            detail_rows += (
+                "<tr>"
+                f"<td>{x['match_date']}</td>"
+                f"<td>{x['team_code'].upper()} {'(H)' if x['is_home'] else '(A)'}</td>"
+                f"<td>{stake_str}</td>"
+                f"<td><span style=\"color:{result_color}; font-weight:600;\">{result_str}</span></td>"
+                f"<td>{row_profit_str}</td>"
+                "</tr>"
+            )
+
+        mw_html += (
+            "<details class=\"mw-block\">"
+            "<summary>"
+            f"<span class=\"mw-title\">Matchweek {mw['matchweek']}</span>"
+            f"<span class=\"mw-stat\">{win_pct}</span>"
+            f"<span class=\"mw-stat\">${mw['total_wagered']:,.2f} wagered</span>"
+            f"<span class=\"mw-stat\" style=\"color:{profit_color}; font-weight:600;\">{profit_str}</span>"
+            f"<span class=\"mw-stat\">{return_str} return</span>"
+            f"<span class=\"mw-stat\">LL {model_ll} / {market_ll}</span>"
+            "</summary>"
+            "<table class=\"mw-detail\"><tr><th>Date</th><th>Team</th><th>Stake</th><th>Result</th><th>Profit</th></tr>"
+            f"{detail_rows}</table>"
+            "</details>"
         )
 
     style = (
@@ -532,10 +604,37 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
         "th, td { padding: 10px 8px; text-align: left; font-size: 14px; border-bottom: 1px solid #eee; } "
         "th { background: #f0f0f0; font-size: 12px; text-transform: uppercase; } "
         ".line-tag { color: #999; font-size: 11px; } "
+        ".mw-block { background: white; border-radius: 8px; margin-bottom: 8px; overflow: hidden; } "
+        ".mw-block summary { padding: 12px; cursor: pointer; list-style: none; display: flex; "
+        "flex-wrap: wrap; gap: 4px 16px; align-items: center; font-size: 13px; } "
+        ".mw-block summary::-webkit-details-marker { display: none; } "
+        ".mw-block summary::before { content: '\\25B8'; margin-right: 4px; color: #999; } "
+        ".mw-block[open] summary::before { content: '\\25BE'; } "
+        ".mw-title { font-weight: 700; font-size: 14px; margin-right: 4px; } "
+        ".mw-stat { color: #444; } "
+        "table.mw-detail { border-radius: 0; margin: 0; box-shadow: none; } "
+        "table.mw-detail th, table.mw-detail td { padding: 8px; } "
         "@media (max-width: 480px) { th, td { font-size: 12px; padding: 8px 4px; } }"
     )
 
+    def logloss_delta_bg(delta, scale=0.04):
+        """delta = model_logloss - market_logloss. Negative means the
+        model beat the market (lower loss is better) -> green; positive
+        means the market beat the model -> red. Intensity scales with
+        magnitude, capped at `scale` (0.04 chosen from the actual spread
+        seen across seasons so far -- deltas beyond that saturate rather
+        than clip abruptly)."""
+        if delta is None:
+            return ""
+        intensity = min(abs(delta) / scale, 1.0)
+        alpha = 0.10 + intensity * 0.55
+        rgb = "26,127,55" if delta < 0 else "192,57,43"
+        return f"background:rgba({rgb},{alpha:.2f});"
+
     season_rows_html = ""
+    total_bets = total_wins = total_losses = 0
+    total_wagered = total_profit = 0.0
+    model_ll_sum = model_ll_n = market_ll_sum = market_ll_n = 0
     for s in season_summaries:
         win_pct = f"{s['wins'] / s['bets_placed']:.0%}" if s['bets_placed'] else "-"
         profit_str = f"{'+' if s['total_profit'] >= 0 else ''}${s['total_profit']:,.2f}"
@@ -543,6 +642,8 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
         return_str = f"{s['return_pct']:+.1%}" if s['return_pct'] is not None else "-"
         model_ll = f"{s['model_logloss']:.3f}" if s['model_logloss'] is not None else "-"
         market_ll = f"{s['market_logloss']:.3f}" if s['market_logloss'] is not None else "-"
+        delta = (s['model_logloss'] - s['market_logloss']) if (s['model_logloss'] is not None and s['market_logloss'] is not None) else None
+        delta_str = f"{delta:+.3f}" if delta is not None else "-"
         season_display = f"{str(s['season'])[:2]}-{str(s['season'])[2:]}"
         season_rows_html += (
             "<tr>"
@@ -554,6 +655,42 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
             f"<td>{return_str}</td>"
             f"<td>{model_ll}</td>"
             f"<td>{market_ll}</td>"
+            f"<td style=\"{logloss_delta_bg(delta)}\">{delta_str}</td>"
+            "</tr>"
+        )
+        total_bets += s['bets_placed']
+        total_wins += s['wins']
+        total_losses += s['losses']
+        total_wagered += s['total_wagered']
+        total_profit += s['total_profit']
+        if s['model_logloss'] is not None:
+            model_ll_sum += s['model_logloss']; model_ll_n += 1
+        if s['market_logloss'] is not None:
+            market_ll_sum += s['market_logloss']; market_ll_n += 1
+
+    if season_summaries:
+        total_win_pct = f"{total_wins / total_bets:.0%}" if total_bets else "-"
+        total_profit_str = f"{'+' if total_profit >= 0 else ''}${total_profit:,.2f}"
+        total_profit_color = "#1a7f37" if total_profit >= 0 else "#c0392b"
+        total_return_str = f"{(total_profit / total_wagered):+.1%}" if total_wagered else "-"
+        # LogLoss/Mkt LogLoss totals are an unweighted mean across seasons
+        # (season_backtests doesn't store a per-season evaluated-instance
+        # count to weight by) -- reasonable here since every EPL season
+        # has ~760 evaluated instances, but flagged via the title tooltip.
+        total_model_ll = model_ll_sum / model_ll_n if model_ll_n else None
+        total_market_ll = market_ll_sum / market_ll_n if market_ll_n else None
+        total_delta = (total_model_ll - total_market_ll) if (total_model_ll is not None and total_market_ll is not None) else None
+        season_rows_html += (
+            "<tr style=\"font-weight:700; border-top:2px solid #ccc;\">"
+            "<td>Total</td>"
+            f"<td>{total_bets}</td>"
+            f"<td>{total_wins}-{total_losses} ({total_win_pct})</td>"
+            f"<td>${total_wagered:,.2f}</td>"
+            f"<td><span style=\"color:{total_profit_color};\">{total_profit_str}</span></td>"
+            f"<td>{total_return_str}</td>"
+            f"<td title=\"Unweighted mean across seasons\">{f'{total_model_ll:.3f}' if total_model_ll is not None else '-'}</td>"
+            f"<td title=\"Unweighted mean across seasons\">{f'{total_market_ll:.3f}' if total_market_ll is not None else '-'}</td>"
+            f"<td style=\"{logloss_delta_bg(total_delta)}\">{f'{total_delta:+.3f}' if total_delta is not None else '-'}</td>"
             "</tr>"
         )
 
@@ -595,18 +732,18 @@ def render_html(bankroll, model_version, results, settled_bets, season_summaries
         "<h1>EPL Model Dashboard</h1>"
         f"<div class=\"meta\">Bankroll: ${bankroll:,.2f} &middot; "
         f"Model version fit {model_version[1].strftime('%Y-%m-%d')} &middot; "
-        f"Updated {date.today()}</div>"
+        f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>"
         f"{xg_warning_html}"
         f"{ratings_warning_html}"
         f"{headcount_warning_html}"
+        "<h2>Today's matches</h2>"
         "<table><tr><th>Date</th><th>Team</th><th>Model %</th><th>Market %</th>"
         f"<th>Stake</th><th>Decision</th><th>Lineup Check</th></tr>{rows_html}</table>"
         "<h2>Results</h2>"
-        "<table><tr><th>Date</th><th>Team</th><th>Stake</th><th>Result</th><th>Profit</th></tr>"
-        f"{history_rows_html}</table>"
+        f"{mw_html if mw_html else '<p class=\"meta\">No settled bets yet.</p>'}"
         "<h2>Past Seasons</h2>"
         "<table><tr><th>Season</th><th>Bets</th><th>Record</th><th>Wagered</th>"
-        "<th>Profit</th><th>Return</th><th>LogLoss</th><th>Mkt LogLoss</th></tr>"
+        "<th>Profit</th><th>Return</th><th>LogLoss</th><th>Mkt LogLoss</th><th>LL &Delta;</th></tr>"
         f"{season_rows_html}</table>"
         "</body></html>"
     )
