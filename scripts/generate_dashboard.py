@@ -244,7 +244,8 @@ def get_candidate_matches(engine):
                 join teams ht on ht.id = m.home_team_id
                 join teams at on at.id = m.away_team_id
                 where m.season = :season and m.status != 'completed'
-                  and exists (select 1 from predicted_lineups pl where pl.match_id = m.id)
+                  and (m.match_date = current_date
+                       or exists (select 1 from predicted_lineups pl where pl.match_id = m.id))
                 order by m.match_date
             """),
             {"season": SEASON},
