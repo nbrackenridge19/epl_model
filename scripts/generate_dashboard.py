@@ -430,60 +430,39 @@ def get_settled_bets(engine):
 
 
 def get_season_summaries(engine):
-    """Every season with real settled bets, including the historically
-    migrated ones. LogLoss/VLogLoss replicate the original spreadsheet's
-    formula exactly: computed across EVERY evaluated instance (bet AND
-    pass decisions both), not just placed bets -- this is a model
-    calibration metric, deliberately separate from the betting-decision
-    layer. LogLoss uses the model's own predicted_prob; VLogLoss uses
-    the market's implied probability from the same odds_used value, as
-    a baseline to compare the model's calibration against the market's."""
+    """Every completed season's walk-forward backtest result -- NOT the
+    real historical bets table. That table holds whatever model was
+    actually live when each bet was historically placed (largely
+    Excel-migrated results from years of different, evolving formulas),
+    which is a real record of what happened but stops being a fair
+    comparison point once the model changes -- it doesn't tell you
+    anything about how the CURRENT modeling approach would have done.
+
+    season_backtests is a precomputed table (see backtest_seasons.py,
+    run manually, not scheduled -- same pattern as fit_model.py) holding
+    a genuine walk-forward backtest: each season refit using only data
+    available before it, respecting the historical team-dummy
+    introduction rule (no C(team_code) before the 1920-2223 training
+    window, matching the original spreadsheet's own formula evolution),
+    with today's possD-drop/strtD-spline structure and [0.3,0.7]
+    probability band applied at every step. Re-run backtest_seasons.py
+    whenever the model or betting-eligibility logic changes, or a new
+    season completes, to keep this current."""
     with engine.connect() as conn:
-        raw = conn.execute(
+        rows = conn.execute(
             text("""
-                select m.season, b.stake, b.outcome, b.profit, b.predicted_prob, b.odds_used
-                from bets b
-                join matches m on m.id = b.match_id
-                where b.outcome is not null
+                select season, bets, wins, losses, wagered, profit, return_pct, logloss, market_logloss
+                from season_backtests order by season
             """)
         ).fetchall()
 
-    by_season = {}
-    for season, stake, outcome, profit, predicted_prob, odds_used in raw:
-        by_season.setdefault(season, []).append(
-            {"stake": stake or 0, "outcome": outcome, "profit": profit or 0,
-             "predicted_prob": predicted_prob, "odds_used": odds_used}
-        )
-
     summaries = []
-    for season in sorted(by_season):
-        bets = by_season[season]
-        placed = [b for b in bets if b["stake"] > 0]
-        wins = sum(1 for b in placed if b["outcome"] == "win")
-        losses = sum(1 for b in placed if b["outcome"] == "loss")
-        total_profit = sum(b["profit"] for b in placed)
-        total_wagered = sum(b["stake"] for b in placed)
-        return_pct = (total_profit / total_wagered) if total_wagered else None
-
-        model_losses, market_losses = [], []
-        for b in bets:  # every evaluated instance, not just placed -- matches the original formula
-            y = 1.0 if b["outcome"] == "win" else 0.0
-            p = b["predicted_prob"]
-            if p is not None and 0 < p < 1:
-                model_losses.append(-(y * math.log(p) + (1 - y) * math.log(1 - p)))
-            ml = b["odds_used"]
-            if ml is not None:
-                implied = moneyline_to_implied_prob(ml)
-                if implied is not None and 0 < implied < 1:
-                    market_losses.append(-(y * math.log(implied) + (1 - y) * math.log(1 - implied)))
-
-        model_logloss = sum(model_losses) / len(model_losses) if model_losses else None
-        market_logloss = sum(market_losses) / len(market_losses) if market_losses else None
-
+    for season, bets, wins, losses, wagered, profit, return_pct, logloss, market_logloss in rows:
         summaries.append({
-            "season": season, "bets_placed": len(placed), "wins": wins, "losses": losses,
-            "total_profit": total_profit, "total_wagered": total_wagered, "return_pct": return_pct,
-            "model_logloss": model_logloss, "market_logloss": market_logloss,
+            "season": season, "bets_placed": bets, "wins": wins, "losses": losses,
+            "total_profit": float(profit), "total_wagered": float(wagered),
+            "return_pct": float(return_pct) if return_pct is not None else None,
+            "model_logloss": float(logloss), "market_logloss": float(market_logloss),
         })
     return summaries
 
