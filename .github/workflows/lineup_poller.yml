@@ -1,14 +1,26 @@
 name: ESPN lineup poller
 
-# Runs every 10 minutes, but only 7am-4pm Eastern (11:00-21:00 UTC covers
-# both EDT and EST, since the season spans the DST boundary) -- matches
-# don't kick off outside this window. Also has a free, no-credit-cost
-# gameday check inside the script itself (queries our own already-synced
-# fixture list) that skips the run entirely with zero ScraperAPI usage
-# on days with no matches at all.
+# Runs every 5 minutes (GitHub Actions' shortest supported interval --
+# below 5 min isn't reliably honored), but only 7am-4pm Eastern
+# (11:00-21:00 UTC covers both EDT and EST, since the season spans the
+# DST boundary) -- matches don't kick off outside this window. Also has
+# a free, no-credit-cost gameday check inside the script itself (queries
+# our own already-synced fixture list) that skips the run entirely with
+# zero ScraperAPI usage on days with no matches at all.
+#
+# Bumped from */10 to */5 on 2026-09-04 after missing a 3pm ET kickoff's
+# lineup window. Worth knowing this doesn't guarantee catching every
+# match: GitHub Actions scheduled workflows are best-effort and can run
+# late during high load (lots of repos fire cron jobs on round intervals
+# like this one, so busy times -- e.g. Saturday early afternoon, a
+# popular EPL kickoff slot -- see the most congestion). 5 minutes is the
+# floor GitHub supports; a true fix would mean triggering off the actual
+# fixture list (e.g. a workflow that computes each match's kickoff time
+# and schedules a one-off run ~60-90 min prior) rather than a fixed
+# cron -- bigger change, not done here.
 on:
   schedule:
-    - cron: "*/10 11-21 * * *"
+    - cron: "*/5 11-21 * * *"
   workflow_dispatch: {}
 
 jobs:
