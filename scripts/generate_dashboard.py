@@ -535,7 +535,7 @@ def summarize_by_matchweek(instances):
             "market_correct": market_correct, "market_evaluated": market_evaluated,
             "total_profit": total_profit, "total_wagered": total_wagered, "return_pct": return_pct,
             "model_logloss": model_logloss, "market_logloss": market_logloss,
-            "instances": sorted(all_instances, key=lambda x: (x["match_date"], x["team_code"])),
+            "instances": sorted(all_instances, key=lambda x: (x["match_date"], str(x["match_id"]), x["is_home"])),
         })
     return summaries
 
@@ -623,6 +623,8 @@ def render_html(bankroll, model_version, results, match_results, season_summarie
         return_str = f"{mw['return_pct']:+.1%}" if mw['return_pct'] is not None else "-"
         model_ll = f"{mw['model_logloss']:.3f}" if mw['model_logloss'] is not None else "-"
         market_ll = f"{mw['market_logloss']:.3f}" if mw['market_logloss'] is not None else "-"
+        mw_ll_delta = (mw['model_logloss'] - mw['market_logloss']) if (mw['model_logloss'] is not None and mw['market_logloss'] is not None) else None
+        mw_ll_delta_str = f"{mw_ll_delta:+.3f}" if mw_ll_delta is not None else "-"
 
         detail_rows = ""
         for x in mw["instances"]:
@@ -660,7 +662,7 @@ def render_html(bankroll, model_version, results, match_results, season_summarie
             f"<span class=\"mw-stat\">${mw['total_wagered']:,.2f} wagered</span>"
             f"<span class=\"mw-stat\" style=\"color:{profit_color}; font-weight:600;\">{profit_str}</span>"
             f"<span class=\"mw-stat\">{return_str} return</span>"
-            f"<span class=\"mw-stat\">LL {model_ll} / {market_ll}</span>"
+            f"<span class=\"mw-stat\">LL = {model_ll}; MktLL = {market_ll}; LL &Delta; = {mw_ll_delta_str}</span>"
             "</summary>"
             "<table class=\"mw-detail\"><tr><th>Date</th><th>Match ID</th><th>Team</th><th>Score</th>"
             "<th>Model %</th><th>Market %</th><th>Wager</th><th>Bet Result</th></tr>"
@@ -669,7 +671,7 @@ def render_html(bankroll, model_version, results, match_results, season_summarie
         )
 
     style = (
-        "body { font-family: -apple-system, sans-serif; max-width: 700px; margin: 0 auto; "
+        "body { font-family: -apple-system, sans-serif; max-width: 1100px; margin: 0 auto; "
         "padding: 16px; background: #fafafa; } "
         "h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; } "
         ".meta { color: #666; font-size: 13px; margin-bottom: 16px; } "
