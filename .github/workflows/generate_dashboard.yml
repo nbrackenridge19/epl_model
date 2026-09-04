@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install sqlalchemy psycopg2-binary patsy
+        run: pip install sqlalchemy psycopg2-binary patsy scipy
 
       - name: Generate dashboard
         env:
