@@ -32,9 +32,24 @@ name: ESPN lineup poller
 # GitHub's scheduler can't be trusted here at ANY frequency, and the
 # next step is triggering externally (e.g. a Cloudflare Worker cron
 # hitting the workflow_dispatch API) instead of via `schedule:` at all.
+#
+# UPDATE 2026-09-05: the hourly-on-the-hour cron above still didn't fire
+# at all (confirmed: zero scheduled runs in Actions history despite
+# workflow_dispatch working every time). Two changes based on real
+# reports of this exact symptom in GitHub's own community forums:
+#   1. Moved off :00 -- the top of every hour is GitHub's single most
+#      congested scheduler moment (everyone's hourly crons fire then),
+#      and GitHub's own guidance is to offset for exactly this reason.
+#   2. This edit itself is also a "resync" -- pushing any change to a
+#      workflow file's schedule can force GitHub to re-register the
+#      trigger, which has fixed identical total-silence symptoms for
+#      other users after a platform-side Actions incident (there was
+#      one on 2026-08-26, per GitHub's status history).
+# If this STILL doesn't fire, that's strong enough evidence to stop
+# trying to fix `schedule:` itself and move to an external trigger.
 on:
   schedule:
-    - cron: "0 9-22 * * *"
+    - cron: "17 9-22 * * *"
   workflow_dispatch: {}
 
 jobs:
