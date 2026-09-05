@@ -1,31 +1,46 @@
 name: ESPN lineup poller
 
-# Runs every 5 minutes (GitHub Actions' shortest supported interval --
-# below 5 min isn't reliably honored), but only 7am-4pm Eastern
-# (11:00-21:00 UTC covers both EDT and EST, since the season spans the
-# DST boundary) -- matches don't kick off outside this window. Also has
-# a free, no-credit-cost gameday check inside the script itself (queries
-# our own already-synced fixture list) that skips the run entirely with
-# zero ScraperAPI usage on days with no matches at all.
+# HOURLY, 5am-6pm Eastern (09:00-22:00 UTC covers both EDT and EST,
+# since the season spans the DST boundary). Redesigned 2026-09-05.
 #
-# Bumped from */10 to */5 on 2026-09-04 after missing a 3pm ET kickoff's
-# lineup window. Worth knowing this doesn't guarantee catching every
-# match: GitHub Actions scheduled workflows are best-effort and can run
-# late during high load (lots of repos fire cron jobs on round intervals
-# like this one, so busy times -- e.g. Saturday early afternoon, a
-# popular EPL kickoff slot -- see the most congestion). 5 minutes is the
-# floor GitHub supports; a true fix would mean triggering off the actual
-# fixture list (e.g. a workflow that computes each match's kickoff time
-# and schedules a one-off run ~60-90 min prior) rather than a fixed
-# cron -- bigger change, not done here.
+# Previously this ran every 5 (then every 10) minutes, relying on
+# GitHub's schedule trigger firing reliably at that cadence. It empirically
+# didn't: real run history showed multi-hour gaps between consecutive
+# "Scheduled" runs even at a nominal 5-minute interval (e.g. a 4-hour gap
+# between two consecutive runs) -- consistent with GitHub's scheduler
+# silently dropping the large majority of ticks for a high-frequency
+# schedule, not just running a few minutes late.
+#
+# The fix: ask GitHub's scheduler for something much less frequent
+# (hourly -- hypothesized to be more reliable given GitHub explicitly
+# cites "high load" as the cause of delays, and load scales with
+# requested frequency; this is a bet, not proven for this account) and
+# do the actual precision timing INSIDE the script itself via
+# time.sleep(), once a run starts. poll_espn_lineups.py now:
+#   - Phase A: keeps matches.kickoff_time populated a few days ahead by
+#     reading ESPN's own kickoff timestamps (piggybacked on the same
+#     scoreboard call the script was already making).
+#   - Phase B: checks whether any of today's matches has kickoff inside
+#     an ~80-minute actionable window; if so, polls for the lineup every
+#     ~4 minutes IN-PROCESS until found or the window closes, entirely
+#     independent of the GitHub scheduler at that point.
+# An 80-minute window against an hourly trigger mathematically
+# guarantees at least one tick lands inside it for every match, as long
+# as hourly ticks themselves don't get dropped.
+#
+# If runs still go missing at this frequency, that's real evidence
+# GitHub's scheduler can't be trusted here at ANY frequency, and the
+# next step is triggering externally (e.g. a Cloudflare Worker cron
+# hitting the workflow_dispatch API) instead of via `schedule:` at all.
 on:
   schedule:
-    - cron: "*/5 11-21 * * *"
+    - cron: "0 9-22 * * *"
   workflow_dispatch: {}
 
 jobs:
   poll:
     runs-on: ubuntu-latest
+    timeout-minutes: 100  # generous margin over the ~80 min a single actionable-match run can take
     steps:
       - uses: actions/checkout@v4
 
