@@ -181,26 +181,35 @@ def parse_games_from_scoreboard(sb):
 
 
 def sync_kickoff_times(engine, teams, matches, season):
-    """Phase A. Backfills matches.kickoff_time for any of the next
-    SYNC_DAYS_AHEAD days that still have a match without one. Skips a
-    day entirely once every match on it already has a kickoff_time --
-    keeps this cheap on days that already synced fine."""
+    """Phase A. Backfills matches.kickoff_time for upcoming matches.
+
+    IMPORTANT: today's and tomorrow's dates are ALWAYS re-checked, even if
+    every match on them already has a kickoff_time -- fixtures get moved
+    by broadcasters right up until close to matchday (confirmed: this bit
+    us for real, a match synced days out at 15:30 UTC actually kicked off
+    at 16:30 UTC, and the original "only fill NULLs" design never
+    refreshed it since the column wasn't null anymore). Dates further out
+    than tomorrow still only get fetched once, since a schedule change
+    further out has more chances to be caught by a later run before it's
+    ever actionable -- keeps this from re-fetching the full
+    SYNC_DAYS_AHEAD window (and its ScraperAPI cost) every single hour."""
     with engine.connect() as conn:
-        missing_dates = conn.execute(
+        stale_or_missing_dates = conn.execute(
             text("""
                 select distinct match_date from matches
-                where season = :season and kickoff_time is null
+                where season = :season
                   and match_date between current_date and current_date + (:days || ' days')::interval
+                  and (kickoff_time is null or match_date <= current_date + interval '1 day')
                 order by match_date
             """),
             {"season": season, "days": SYNC_DAYS_AHEAD},
         ).fetchall()
 
-    if not missing_dates:
+    if not stale_or_missing_dates:
         print("Phase A: kickoff_time already synced for the upcoming window, nothing to do.", flush=True)
         return
 
-    for (d,) in missing_dates:
+    for (d,) in stale_or_missing_dates:
         yyyymmdd = d.strftime("%Y%m%d")
         try:
             sb = fetch_json(SCOREBOARD_URL, params={"dates": yyyymmdd})
@@ -223,11 +232,14 @@ def sync_kickoff_times(engine, teams, matches, season):
                 if match_id is None:
                     continue
                 result = conn.execute(
-                    text("update matches set kickoff_time = :kt where id = :mid and kickoff_time is null"),
+                    text("""
+                        update matches set kickoff_time = :kt
+                        where id = :mid and (kickoff_time is null or kickoff_time != :kt)
+                    """),
                     {"kt": g["kickoff_utc"].time(), "mid": match_id},
                 )
                 synced += result.rowcount
-        print(f"  Phase A: {d} -- {len(games)} game(s) on ESPN's scoreboard, {synced} kickoff_time(s) newly set", flush=True)
+        print(f"  Phase A: {d} -- {len(games)} game(s) on ESPN's scoreboard, {synced} kickoff_time(s) set/corrected", flush=True)
 
 
 def get_actionable_matches(engine, season):
