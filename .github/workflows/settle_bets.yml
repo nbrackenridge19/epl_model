@@ -25,7 +25,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install sqlalchemy psycopg2-binary
+        run: pip install "sqlalchemy<2.1" psycopg2-binary
 
       - name: Run settle_bets
         env:
