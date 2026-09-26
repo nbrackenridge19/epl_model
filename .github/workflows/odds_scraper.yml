@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install requests sqlalchemy psycopg2-binary
+        run: pip install requests "sqlalchemy<2.1" psycopg2-binary
       - name: Run odds scraper (today only)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -42,7 +42,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install requests sqlalchemy psycopg2-binary
+        run: pip install requests "sqlalchemy<2.1" psycopg2-binary
       - name: Run odds scraper (full week ahead)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
