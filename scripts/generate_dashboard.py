@@ -292,6 +292,23 @@ def get_latest_odds(engine, match_id):
     return row
 
 
+def get_bet_odds(engine, match_id):
+    """The odds row bets are evaluated against. Prefers the lineup_release snapshot (captured at T-50 by the
+    Cloudflare trigger Worker, around lineup release), so a later closing snapshot (T-5, kept for the data model)
+    never changes a bet. If a match has no lineup_release row (e.g. that capture failed), falls back to the
+    newest row, which is the previous behaviour: a closing row is still bettable, an opening row is not."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                select home_odds, away_odds, line_type from odds
+                where match_id = :match_id and source = 'espn_draftkings'
+                order by (line_type = 'lineup_release') desc, captured_at desc limit 1
+            """),
+            {"match_id": match_id},
+        ).fetchone()
+    return row
+
+
 def spline_basis(value, knots, degree=3, lower_bound=None, upper_bound=None):
     """Reconstructs the exact same B-spline basis patsy produced at fit
     time for a single raw value, using the knot locations (and explicit
@@ -367,10 +384,12 @@ def evaluate_side(model_prob, ml, line_type, bankroll, edge_threshold, games_pla
     if ml is None:
         return {"status": "no_odds", "model_prob": model_prob}
 
-    if line_type != "closing":
+    if line_type not in ("lineup_release", "closing"):
         # Opening line (or a legacy/untyped row) -- illustrative only. The
-        # line can still move before kickoff, so never compute kf/stake
-        # off it; wait for the actual closing snapshot.
+        # line can still move a lot before kickoff, so never compute kf/stake
+        # off it; wait for the lineup_release snapshot (captured at T-50).
+        # ("closing" stays bettable as a fallback for a match whose
+        # lineup_release capture failed -- see get_bet_odds.)
         return {"status": "awaiting_closing", "model_prob": model_prob, "implied_prob": implied_prob,
                 "line_type": line_type, "moneyline": ml}
 
@@ -582,7 +601,7 @@ def render_html(bankroll, model_version, results, match_results, season_summarie
     rows_html = ""
     for r in results:
         badge = {"bet": "BET", "pass": "pass", "too_early": "too early",
-                 "awaiting_closing": "awaiting closing line",
+                 "awaiting_closing": "awaiting lineup odds",
                  "outside_prob_band": "outside betting band",
                  "no_odds": "no odds yet", "no_prediction": "no lineup yet"}[r["status"]]
         badge_color = {"bet": "#1a7f37", "pass": "#666", "too_early": "#999",
@@ -847,7 +866,7 @@ if __name__ == "__main__":
     with engine.begin() as conn:
         for m in matches:
             match_id, match_date, home_code, away_code, home_id, away_id = m
-            odds = get_latest_odds(engine, match_id)
+            odds = get_bet_odds(engine, match_id)
             home_ml, away_ml, line_type = odds if odds else (None, None, None)
 
             for team_id, team_code, ml, is_home in [

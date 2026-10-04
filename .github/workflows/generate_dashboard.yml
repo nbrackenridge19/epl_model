@@ -13,6 +13,12 @@ on:
 permissions:
   contents: write
 
+# The timed lineup/odds workflows also start this workflow, so make sure two runs never overlap and
+# race each other to push docs/index.html.
+concurrency:
+  group: dashboard
+  cancel-in-progress: false
+
 jobs:
   generate:
     runs-on: ubuntu-latest

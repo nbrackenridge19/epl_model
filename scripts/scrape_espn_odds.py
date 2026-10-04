@@ -1,30 +1,32 @@
 """
-EPL model: live ESPN odds scraper.
+EPL model: ESPN DraftKings odds scraper. Two modes, chosen by the ODDS_MODE environment variable.
 
-Adapted from the user's existing, proven ESPN odds script -- same core
-API calls and logic, redirected to write into the odds table instead of
-Excel. Replaces the manual moneyline paste into the old `data` tab.
+Hits ESPN's public JSON API (through the ScraperAPI proxy on GitHub Actions) and writes one row per
+capture into `odds` (source='espn_draftkings'). Rows are never updated or overwritten -- the table keeps
+every capture so line movement is preserved.
 
-Unlike the FBref scraper, this hits ESPN's public JSON API directly
-(no HTML scraping, no bot-detection dance needed based on the reference
-script -- no proxy was required there).
+MODE "sweep" (default) -- the once-daily wide scan (odds_scraper.yml)
+  Scans today -ODDS_DAYS_BACK .. +ODDS_DAYS_FORWARD days. For any match that has NO espn_draftkings row
+  yet it stores the first snapshot as line_type='opening'. Matches that already have any snapshot are
+  skipped. It no longer captures closing lines; that moved to the timed mode below.
 
-Writes one row per game per run into `odds` (source='espn_draftkings'),
-NOT an upsert -- the odds table intentionally keeps every capture over
-time so you can see line movement, matching how it was designed earlier
-in this project. Re-running this on a schedule (e.g. daily, or several
-times as kickoff approaches) is expected and fine.
+MODE "single" -- one match, one labelled snapshot, started by the Cloudflare trigger Worker
+  (epl_odds_trigger.yml, repository_dispatch event "epl-odds"). Environment: MATCH_ID (matches.id UUID)
+  and LINE_TYPE, which is one of:
+    lineup_release  captured at T-50 minutes before kickoff, around when lineups are posted. The dashboard
+                    evaluates bets against this line.
+    closing         captured at T-5 minutes before kickoff. Stored for the data model; bets do not use it.
+  If DraftKings has not posted odds yet it retries up to ATTEMPTS times, RETRY_SLEEP_SEC apart, and never
+  past kickoff. A match that already has a row with that line_type is skipped, so a repeated dispatch can
+  never write a duplicate. Exits 1 if nothing could be captured, so the GitHub run shows red.
 
-CAUTION: team name mapping (ESPN's names -> our team codes) now comes
-directly from the user's own epl_team_codes.xlsx -- no longer a guess.
-Still worth watching for SKIP messages on first run in case ESPN's
-scoreboard API uses a slightly different name than that reference file
-in some edge case, but this should be solid.
+CAUTION: team name mapping (ESPN's names -> our team codes) comes from the user's own epl_team_codes.xlsx.
+Watch for SKIP messages in case ESPN's scoreboard uses a slightly different name in some edge case.
+
+Environment: DATABASE_URL, optional SCRAPERAPI_PROXY_URL, optional DRY_RUN=true.
 
 SETUP:
     pip install requests sqlalchemy psycopg2-binary --break-system-packages
-
-Set DATABASE_URL the same way as the other migration scripts.
 """
 
 import os
@@ -41,25 +43,18 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=280)
 
 SEASON = 2627  # matches this database's season-numbering convention
 
-# Rolling window: today +/- this many days. For a live/ongoing run this
-# naturally re-captures odds for upcoming fixtures as kickoff approaches
-# (line movement) and catches anything just finished. For a first TEST,
-# set DAYS_BACK/DAYS_FORWARD to bracket a date you know has real fixtures
-# (e.g. opening weekend) rather than relying on "today" alone.
-# Overridable via environment variable so the SAME script can run in two
-# modes from two different GitHub Actions schedules: a frequent, narrow
-# scan (today only, for closing-line capture) and a much less frequent,
-# wide scan (the full week ahead, for discovering new matches and their
-# opening snapshot). Running the wide window frequently was pure waste --
-# matches 5-7 days out can never be in the closing window yet anyway, so
-# scanning them every 15 minutes bought nothing.
+# Sweep mode only: scan today - DAYS_BACK .. today + DAYS_FORWARD. The daily wide scan uses DAYS_FORWARD=7 to
+# discover new fixtures and store their opening snapshot.
 DAYS_BACK = int(os.environ.get("ODDS_DAYS_BACK", "0"))
 DAYS_FORWARD = int(os.environ.get("ODDS_DAYS_FORWARD", "0"))
 
-# How close to kickoff counts as "closing line" territory -- a second
-# capture only happens once a match is within this many minutes of
-# kickoff, capturing the most informative snapshot for a betting model.
-CLOSING_WINDOW_MINUTES = 45
+ODDS_MODE = os.environ.get("ODDS_MODE", "sweep").strip().lower()
+DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
+
+# Single mode: how many times to try for odds that are not posted yet, and how long to wait between tries.
+ATTEMPTS = 4
+RETRY_SLEEP_SEC = 60
+VALID_LINE_TYPES = ("lineup_release", "closing")
 
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"
 ODDS_URL_TMPL = "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1/events/{event_id}/competitions/{comp_id}/odds"
@@ -207,27 +202,14 @@ def process_game(conn, teams, matches, game):
         print(f"  SKIP: no matching database row for {game['home_team']} vs {game['away_team']}", flush=True)
         return
 
-    # Time-gating: GitHub Actions cron can't dynamically schedule "N
-    # minutes before THIS match's kickoff" (schedules are static, kickoff
-    # times vary week to week) -- so this runs frequently instead, and
-    # decides per-match whether to actually capture right now. Always
-    # capture the FIRST snapshot we ever see for a match (an early
-    # reference point), then only capture again once within
-    # CLOSING_WINDOW_MINUTES of kickoff (the closing line -- the most
-    # informative single snapshot for a betting model). This avoids
-    # writing a near-duplicate row every single run for a match that's
-    # still hours away.
-    mins_to_kickoff = minutes_until_kickoff(game.get("game_time"))
+    # Sweep mode only captures the very first snapshot for a match ("opening"). The timed lineup_release and
+    # closing snapshots come from single mode, started by the Cloudflare Worker.
     already_captured = conn.execute(
         text("select 1 from odds where match_id = :match_id and source = 'espn_draftkings' limit 1"),
         {"match_id": match_id},
     ).fetchone() is not None
-
-    is_closing_window = mins_to_kickoff is not None and 0 <= mins_to_kickoff <= CLOSING_WINDOW_MINUTES
-    if already_captured and not is_closing_window:
-        print(f"  SKIP (not yet in closing window): {game['home_team']} vs {game['away_team']} "
-              f"({mins_to_kickoff:.0f} min to kickoff)" if mins_to_kickoff is not None else
-              f"  SKIP (already captured, no kickoff time available): {game['home_team']} vs {game['away_team']}", flush=True)
+    if already_captured:
+        print(f"  SKIP (opening already captured): {game['home_team']} vs {game['away_team']}", flush=True)
         return
 
     try:
@@ -241,7 +223,11 @@ def process_game(conn, teams, matches, game):
         print(f"  {game['home_team']} vs {game['away_team']}: no DraftKings odds posted yet", flush=True)
         return
 
-    tag = "closing" if is_closing_window else "opening"
+    tag = "opening"
+    if DRY_RUN:
+        print(f"  [dry run] would write {tag} odds: {game['home_team']} ({home_ml}) vs {game['away_team']} ({away_ml}), "
+              f"draw ({draw_ml})", flush=True)
+        return
     conn.execute(
         text("""
             insert into odds (match_id, source, market, home_odds, away_odds, draw_odds, captured_at, line_type)
@@ -253,7 +239,94 @@ def process_game(conn, teams, matches, game):
     print(f"  wrote {tag} odds: {game['home_team']} ({home_ml}) vs {game['away_team']} ({away_ml}), draw ({draw_ml})", flush=True)
 
 
+def capture_single(engine, match_id, line_type):
+    """Single mode. Returns True if the snapshot was captured (or was already there), False otherwise."""
+    if line_type not in VALID_LINE_TYPES:
+        raise SystemExit(f"LINE_TYPE must be one of {VALID_LINE_TYPES}, got {line_type!r}.")
+    if not match_id:
+        raise SystemExit("MATCH_ID is not set.")
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                select ht.code, at.code, m.match_date, m.kickoff_time, m.status
+                from matches m
+                join teams ht on ht.id = m.home_team_id
+                join teams at on at.id = m.away_team_id
+                where m.id = :mid
+            """),
+            {"mid": match_id},
+        ).fetchone()
+        if row is None:
+            raise SystemExit(f"No match found with id {match_id}.")
+        home_code, away_code, match_date, kickoff_time, status = row
+        already = conn.execute(
+            text("select 1 from odds where match_id = :mid and source = 'espn_draftkings' "
+                 "and line_type = :lt limit 1"),
+            {"mid": match_id, "lt": line_type},
+        ).fetchone()
+
+    label = f"{home_code} vs {away_code} [{line_type}]"
+    if status == "completed":
+        print(f"{label}: match already completed -- nothing to do.", flush=True)
+        return True
+    if already:
+        print(f"{label}: a {line_type} snapshot already exists -- skipping.", flush=True)
+        return True
+
+    kickoff_utc = datetime.combine(match_date, kickoff_time, tzinfo=timezone.utc) if kickoff_time else None
+    print(f"{label}: kickoff {kickoff_utc.isoformat() if kickoff_utc else 'unknown'} -- DRY_RUN={DRY_RUN}", flush=True)
+
+    sb = fetch_json(SCOREBOARD_URL, params={"dates": match_date.strftime("%Y%m%d")})
+    game = None
+    for g in parse_games_from_scoreboard(sb):
+        if (NORMALIZED_NAME_TO_CODE.get(normalize_team_name(g["home_team"])) == home_code
+                and NORMALIZED_NAME_TO_CODE.get(normalize_team_name(g["away_team"])) == away_code):
+            game = g
+            break
+    if game is None:
+        print(f"{label}: not found on ESPN's scoreboard for {match_date}.", flush=True)
+        return False
+
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            odds_json = fetch_json(ODDS_URL_TMPL.format(event_id=game["event_id"], comp_id=game["competition_id"]))
+            home_ml, away_ml, draw_ml = extract_draftkings_moneylines(odds_json)
+        except Exception as e:  # noqa: BLE001
+            print(f"  attempt {attempt}/{ATTEMPTS}: could not fetch odds: {e}", flush=True)
+            home_ml = away_ml = draw_ml = None
+
+        if home_ml is not None or away_ml is not None or draw_ml is not None:
+            if DRY_RUN:
+                print(f"  [dry run] would write {line_type}: home {home_ml}, away {away_ml}, draw {draw_ml}", flush=True)
+                return True
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        insert into odds (match_id, source, market, home_odds, away_odds, draw_odds, captured_at, line_type)
+                        values (:match_id, 'espn_draftkings', 'moneyline', :home_odds, :away_odds, :draw_odds, now(), :line_type)
+                    """),
+                    {"match_id": match_id, "home_odds": home_ml, "away_odds": away_ml, "draw_odds": draw_ml,
+                     "line_type": line_type},
+                )
+            print(f"  wrote {line_type} odds: home {home_ml}, away {away_ml}, draw {draw_ml}", flush=True)
+            return True
+
+        print(f"  attempt {attempt}/{ATTEMPTS}: no DraftKings odds posted yet", flush=True)
+        if attempt == ATTEMPTS:
+            break
+        if kickoff_utc is not None and datetime.now(timezone.utc) >= kickoff_utc:
+            print("  kickoff has passed -- giving up.", flush=True)
+            break
+        time.sleep(RETRY_SLEEP_SEC)
+    return False
+
+
 if __name__ == "__main__":
+    if ODDS_MODE == "single":
+        raise SystemExit(0 if capture_single(engine, os.environ.get("MATCH_ID", "").strip(),
+                                             os.environ.get("LINE_TYPE", "").strip()) else 1)
+
     teams = teams_map(engine)
     matches = match_id_map(engine, SEASON)
 

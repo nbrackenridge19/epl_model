@@ -1,0 +1,56 @@
+name: EPL scheduler (sync Worker timers)
+
+# Keeps the Cloudflare trigger Worker's per-match timers in sync with the fixture table:
+# refreshes matches.kickoff_time from ESPN, then POSTs each upcoming match's kickoff time to the
+# Worker, which sets that match's alarms (T-50 lineup + odds, T-25 lineup safety run, T-5 odds).
+# Repeating a call for an unchanged kickoff is a no-op; a changed kickoff moves the timers.
+#
+# Triggered two ways: (1) the Worker's own cron trigger sends an "epl-schedule" repository_dispatch
+# every 30 minutes (the reliable path), and (2) a slower GitHub cron below as a backup.
+# Running both is harmless.
+
+on:
+  repository_dispatch:
+    types: [epl-schedule]
+  schedule:
+    - cron: "17 * * * *"  # backup only -- the Worker's cron trigger is the primary
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (true = no database writes and no POSTs to the Worker)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: epl-scheduler
+  cancel-in-progress: false
+
+jobs:
+  schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests "sqlalchemy<2.1" psycopg2-binary
+
+      - name: Sync Worker timers with the fixture table
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          SCHEDULE_SECRET: ${{ secrets.SCHEDULE_SECRET }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python scripts/epl_scheduler.py

@@ -1,0 +1,74 @@
+name: EPL odds capture (timed)
+
+# Started by the Cloudflare trigger Worker with an "epl-odds" repository_dispatch for ONE match:
+#   - at T-50 minutes before kickoff, line_type = lineup_release (the line bets are evaluated against)
+#   - at T-5 minutes before kickoff,  line_type = closing        (stored for the data model only)
+# Replaces the old every-15-minutes "frequent" job in odds_scraper.yml. The script skips a match that
+# already has a snapshot with that line_type, so a repeated dispatch cannot write a duplicate.
+#
+# The final step refreshes the dashboard so a bet can show up as soon as the lineup_release odds are in.
+
+on:
+  repository_dispatch:
+    types: [epl-odds]
+  workflow_dispatch:
+    inputs:
+      match_id:
+        description: "matches.id (UUID) to capture"
+        required: true
+        type: string
+      line_type:
+        description: "Which snapshot to capture"
+        required: true
+        default: "lineup_release"
+        type: choice
+        options:
+          - "lineup_release"
+          - "closing"
+      dry_run:
+        description: "Dry run (true = no database writes)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  actions: write  # lets the last step start the dashboard workflow
+
+concurrency:
+  group: epl-odds-${{ github.event.client_payload.match_id || github.event.inputs.match_id }}-${{ github.event.client_payload.line_type || github.event.inputs.line_type }}
+  cancel-in-progress: false
+
+jobs:
+  odds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests "sqlalchemy<2.1" psycopg2-binary
+
+      - name: Capture odds
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
+          ODDS_MODE: single
+          MATCH_ID: ${{ github.event.client_payload.match_id || github.event.inputs.match_id }}
+          LINE_TYPE: ${{ github.event.client_payload.line_type || github.event.inputs.line_type }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python scripts/scrape_espn_odds.py
+
+      - name: Refresh dashboard
+        if: success() && github.event.inputs.dry_run != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run generate_dashboard.yml --repo "${{ github.repository }}"

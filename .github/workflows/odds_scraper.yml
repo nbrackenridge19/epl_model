@@ -1,22 +1,18 @@
-name: ESPN odds scraper
+name: ESPN odds scraper (daily opening sweep)
 
-# Split into two schedules to avoid re-scanning a full week's worth of
-# fixtures on every run:
-#   - "frequent": today only, every 15 min during matchday hours --
-#     catches the closing-line window for whatever's kicking off soon.
-#   - "daily-wide": once a day, scans the full week ahead -- discovers
-#     new matches as they enter the window and captures their opening
-#     snapshot (the script's own "first time seeing this match" logic
-#     handles that automatically).
+# Once a day, scans the full week ahead and stores the first odds snapshot for any new fixture
+# (line_type = 'opening'). The script skips any match that already has a snapshot.
+#
+# The old every-15-minutes "frequent" job is gone: the lineup_release (T-50) and closing (T-5)
+# snapshots are now captured per match at exact times by epl_odds_trigger.yml, started by the
+# Cloudflare trigger Worker.
 on:
   schedule:
-    - cron: "*/15 11-21 * * *"   # frequent, narrow -- 7am-4pm Eastern (covers both EDT/EST)
-    - cron: "30 7 * * *"          # daily, wide
+    - cron: "30 7 * * *"
   workflow_dispatch: {}
 
 jobs:
-  frequent:
-    if: github.event.schedule == '*/15 11-21 * * *' || github.event_name == 'workflow_dispatch'
+  opening_sweep:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,28 +21,11 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install requests "sqlalchemy<2.1" psycopg2-binary
-      - name: Run odds scraper (today only)
+      - name: Run odds scraper (full week ahead, opening snapshots only)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
+          ODDS_MODE: sweep
           ODDS_DAYS_BACK: "0"
-          ODDS_DAYS_FORWARD: "0"
-        run: python scripts/scrape_espn_odds.py
-
-  daily_wide:
-    if: github.event.schedule == '30 7 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: pip install requests "sqlalchemy<2.1" psycopg2-binary
-      - name: Run odds scraper (full week ahead)
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
-          ODDS_DAYS_BACK: "2"
           ODDS_DAYS_FORWARD: "7"
         run: python scripts/scrape_espn_odds.py

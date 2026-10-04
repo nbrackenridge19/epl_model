@@ -1,0 +1,24 @@
+name = "epl-trigger-worker"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+[vars]
+GITHUB_OWNER = "nbrackenridge19"
+GITHUB_REPO = "epl_model"
+
+# One Durable Object per match holds that match's timers.
+[[durable_objects.bindings]]
+name = "MATCH_ALARM"
+class_name = "MatchAlarm"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MatchAlarm"]
+
+# Fires the "epl-schedule" event, which runs epl_scheduler.yml to push fresh kickoff times to this Worker.
+[triggers]
+crons = ["*/30 * * * *"]
+
+# Secrets (set once with `npx wrangler secret put <NAME>`, never written in this file):
+#   GITHUB_TOKEN     fine-grained GitHub token for the epl_model repo only
+#   SCHEDULE_SECRET  shared password between GitHub and this Worker

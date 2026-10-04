@@ -1,0 +1,67 @@
+name: EPL lineup capture (timed)
+
+# Started by the Cloudflare trigger Worker with an "epl-lineup" repository_dispatch for ONE match:
+#   - at T-50 minutes before kickoff (attempt = primary): polls ESPN every 5 minutes inside this job until
+#     both teams' lineups are posted, or 10 minutes after kickoff.
+#   - at T-25 (attempt = safety): the concurrency group below queues it behind the primary run. When it
+#     starts, the script sees the lineups are already captured and exits at once. It only does real work
+#     if the primary run crashed.
+# Replaces the old hourly lineup_poller.yml.
+#
+# A run that ends without capturing both lineups exits red on purpose, so a miss is visible in the
+# Actions list. The final step refreshes the dashboard so a bet can show up as soon as lineups are in.
+
+on:
+  repository_dispatch:
+    types: [epl-lineup]
+  workflow_dispatch:
+    inputs:
+      match_id:
+        description: "matches.id (UUID) to capture"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run (true = no database writes)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  actions: write  # lets the last step start the dashboard workflow
+
+concurrency:
+  group: epl-lineup-${{ github.event.client_payload.match_id || github.event.inputs.match_id }}
+  cancel-in-progress: false
+
+jobs:
+  lineup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80  # ~60 min of in-job polling (T-50 to T+10) plus margin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests "sqlalchemy<2.1" psycopg2-binary
+
+      - name: Capture lineup
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
+          MATCH_ID: ${{ github.event.client_payload.match_id || github.event.inputs.match_id }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python scripts/poll_espn_lineups.py
+
+      - name: Refresh dashboard
+        if: success() && github.event.inputs.dry_run != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run generate_dashboard.yml --repo "${{ github.repository }}"

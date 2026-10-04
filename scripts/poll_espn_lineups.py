@@ -1,75 +1,42 @@
 """
-EPL model: fixture-aware ESPN lineup poller.
+EPL model: single-match ESPN lineup poller.
 
-REDESIGNED 2026-09-05 -- see below for why.
+REDESIGNED 2026-10-04 -- now started per match by the Cloudflare trigger Worker.
 
-Runs HOURLY (not every 5 min). Two phases each run:
+History: this used to run hourly from a GitHub `schedule:` cron and decide for itself which of
+today's matches were in an actionable window. GitHub's scheduler proved unreliable (long gaps, then
+no scheduled runs at all), so timing moved to a Cloudflare Worker that sends a `repository_dispatch`
+event ("epl-lineup") at T-50 minutes before each kickoff and again at T-25 (a safety run). See
+worker/ and .github/workflows/epl_lineup_trigger.yml.
 
-  Phase A -- sync kickoff times. Queries ESPN's scoreboard for any of the
-  next SYNC_DAYS_AHEAD days that still have a match missing kickoff_time,
-  and backfills it. This is what lets Phase B work BEFORE match day
-  arrives -- previously kickoff_time was never populated at all (column
-  existed, nothing wrote to it), so there was no way to know in advance
-  when to expect a kickoff.
+This script now handles exactly ONE match, given by the MATCH_ID environment variable (the
+matches.id UUID). It polls ESPN's summary endpoint for that match every POLL_INTERVAL_SEC (5 min)
+inside this one job run until BOTH teams' lineups are posted, or until LATE_CUTOFF_MIN minutes after
+kickoff. It exits 1 if the lineups were never captured so the failure shows up as a red run in
+GitHub Actions instead of passing silently.
 
-  Phase B -- if any of TODAY's matches has its kickoff inside
-  [now - LATE_CUTOFF_MIN, now + EARLY_MARGIN_MIN] (i.e. we're in the
-  actionable pre-kickoff-through-just-after-kickoff window), poll ESPN's
-  summary endpoint for that match repeatedly INSIDE this one job run
-  (POLL_INTERVAL_SEC apart) until either a lineup is found or the window
-  closes. This is the key change: the fine-grained ~4-minute cadence
-  needed near kickoff no longer depends on GitHub's scheduler firing
-  reliably at that cadence -- it happens via time.sleep() inside a
-  single job execution, well under GitHub's 6-hour job limit.
+The T-25 safety run is queued behind the T-50 run by the workflow's per-match concurrency group. By
+the time it starts, the lineups are normally already captured, and lineup_already_captured() makes it
+exit immediately. It only does real work if the T-50 run crashed.
 
-WHY THIS EXISTS: the previous design (schedule: "*/5 ...", relying on
-GitHub firing a fresh job every 5 minutes) was empirically NOT
-happening -- real run history showed multi-hour gaps between
-consecutive "Scheduled" runs even after cutting the interval, e.g. a
-4-hour gap between two consecutive runs at a nominal 5-minute cadence.
-That's consistent with GitHub's scheduler dropping the large majority
-of ticks for a high-frequency schedule, not just running a few minutes
-late (GitHub's own docs only promise occasional delays during high
-load, not near-total drops). The fix here is to ask GitHub's scheduler
-for something much less frequent (hourly -- a much lower-volume ask of
-the same mechanism, hypothesized to be more reliable, though this is a
-bet rather than something proven for this specific account) and do the
-actual precision timing in-process instead. If hourly checks turn out
-to ALSO get dropped at a similar rate, that's evidence GitHub's
-scheduler can't be trusted at any frequency for this account, and the
-next step would be triggering externally (e.g. a Cloudflare Worker cron
-hitting the workflow_dispatch API) instead of via `schedule:` at all --
-not attempted here per an explicit preference to avoid new
-infrastructure unless GitHub-only options are exhausted.
+kickoff_time is stored as a bare TIME (no timezone in the column type), by convention interpreted as
+UTC to match match_date (also effectively a UTC calendar date, consistent with ESPN's own `date`
+field -- always UTC, e.g. "2026-09-04T19:00Z"). match_date + kickoff_time together reconstruct the
+full UTC kickoff instant. Keeping matches.kickoff_time accurate is the job of sync_kickoff_times()
+below, which epl_scheduler.py calls every 30 minutes.
 
-An hourly cadence checking an 80-minute-wide actionable window
-mathematically guarantees at least one tick lands inside that window
-for every match, AS LONG AS hourly ticks themselves don't get dropped --
-window width (80 min) exceeds tick spacing (60 min), so by the
-pigeonhole principle no kickoff can have its whole window fall between
-two consecutive ticks.
+Deliberately does NOT use subbedIn/subbedOut -- confirmed those fields are inconsistently shaped
+across competitions (plain booleans in some, {'didSub': bool} objects in others), but this poller
+doesn't need them at all: it only cares about the PRE-match predicted starter/bench split, which the
+'starter' boolean gives directly and consistently.
 
-kickoff_time is stored as a bare TIME (no timezone in the column type),
-by convention interpreted as UTC to match match_date (which is also
-effectively a UTC calendar date, consistent with how ESPN's own `date`
-field -- always UTC, e.g. "2026-09-04T19:00Z" -- lines up with what's
-already stored there). match_date + kickoff_time together reconstruct
-the full UTC kickoff instant.
+Each write UPSERTs (on conflict do update) rather than accumulates -- polling repeatedly as kickoff
+approaches naturally keeps the latest prediction, overwriting an earlier guess if the lineup changes.
 
-Deliberately does NOT use subbedIn/subbedOut -- confirmed those fields
-are inconsistently shaped across competitions (plain booleans in some,
-{'didSub': bool} objects in others), but this poller doesn't need them
-at all: it only cares about the PRE-match predicted starter/bench split,
-which the 'starter' boolean gives directly and consistently.
-
-Each write UPSERTs (on conflict do update) rather than accumulates --
-polling repeatedly as kickoff approaches naturally keeps the latest
-prediction, overwriting an earlier guess if the lineup changes.
+Environment: DATABASE_URL, MATCH_ID, optional SCRAPERAPI_PROXY_URL, optional DRY_RUN=true.
 
 SETUP:
     pip install requests sqlalchemy psycopg2-binary --break-system-packages
-
-Set DATABASE_URL the same way as the other migration scripts.
 """
 
 import os
@@ -89,17 +56,19 @@ SEASON = 2627
 # Phase A: how many days ahead to keep kickoff_time populated for.
 SYNC_DAYS_AHEAD = 5
 
-# Phase B: actionable window around kickoff, and in-job poll cadence.
-LATE_CUTOFF_MIN = 10     # keep trying up to this long AFTER kickoff
-EARLY_MARGIN_MIN = 70    # start being willing to try this long BEFORE kickoff
-POLL_INTERVAL_SEC = 240  # ~4 min between in-job poll attempts
+# In-job lineup polling: keep trying until this long AFTER kickoff, checking every POLL_INTERVAL_SEC.
+LATE_CUTOFF_MIN = 10
+POLL_INTERVAL_SEC = 300  # 5 min between in-job poll attempts
+# Lineup rows written at or after (kickoff - this) count as "already captured" for the safety run. ESPN
+# lineups appear roughly an hour out; the first poll is at T-50, so anything written since T-55 is from this flow.
+CAPTURED_SINCE_MIN = 55
 
 SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"
 SUMMARY_URL_TMPL = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event={event_id}"
 
-# SAFETY: dry run first -- prints what it WOULD write without touching
-# the database.
-DRY_RUN = False
+# SAFETY: DRY_RUN=true prints what it WOULD write without touching the database. Defaults to a real run,
+# because this only ever starts from a real dispatch for a real match (use the workflow's dry_run input to test).
+DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
 
 S = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
@@ -192,7 +161,7 @@ def sync_kickoff_times(engine, teams, matches, season):
     than tomorrow still only get fetched once, since a schedule change
     further out has more chances to be caught by a later run before it's
     ever actionable -- keeps this from re-fetching the full
-    SYNC_DAYS_AHEAD window (and its ScraperAPI cost) every single hour."""
+    SYNC_DAYS_AHEAD window (and its ScraperAPI cost) every single run."""
     with engine.connect() as conn:
         stale_or_missing_dates = conn.execute(
             text("""
@@ -240,41 +209,6 @@ def sync_kickoff_times(engine, teams, matches, season):
                 )
                 synced += result.rowcount
         print(f"  Phase A: {d} -- {len(games)} game(s) on ESPN's scoreboard, {synced} kickoff_time(s) set/corrected", flush=True)
-
-
-def get_actionable_matches(engine, season):
-    """Phase B gate. Any of TODAY's matches whose kickoff (match_date +
-    kickoff_time, both UTC by convention) falls inside
-    [now - LATE_CUTOFF_MIN, now + EARLY_MARGIN_MIN]. Returns dicts with
-    everything process_game needs -- no separate lookup required later."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                select m.id, ht.code, at.code,
-                       (m.match_date + m.kickoff_time) at time zone 'UTC' as kickoff_utc
-                from matches m
-                join teams ht on ht.id = m.home_team_id
-                join teams at on at.id = m.away_team_id
-                where m.season = :season and m.match_date = current_date and m.kickoff_time is not null
-            """),
-            {"season": season},
-        ).fetchall()
-
-    now = datetime.now(timezone.utc)
-    actionable = []
-    for mid, home_code, away_code, kickoff_utc in rows:
-        # psycopg2 returns a tz-aware datetime for a timestamptz column.
-        # Convert (not blindly relabel) to UTC -- safe regardless of
-        # whatever timezone the DB session itself reports in.
-        if kickoff_utc.tzinfo is not None:
-            kickoff_utc = kickoff_utc.astimezone(timezone.utc)
-        else:
-            kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
-        delta_min = (kickoff_utc - now).total_seconds() / 60
-        if -LATE_CUTOFF_MIN <= delta_min <= EARLY_MARGIN_MIN:
-            actionable.append({"match_id": mid, "home_code": home_code, "away_code": away_code,
-                                "kickoff_utc": kickoff_utc})
-    return actionable
 
 
 def get_or_create_player(conn, name, team_id):
@@ -327,11 +261,11 @@ def get_or_create_player(conn, name, team_id):
 
 
 def find_event_id(match):
-    """The scoreboard call gives us event_id by date; today's scoreboard
+    """The scoreboard call gives us event_id by date; the match day's scoreboard
     fetch is cheap (one request) and lets us map our match_id -> ESPN's
     event_id for the summary call that actually has roster data."""
-    today = datetime.now(timezone.utc).date()
-    sb = fetch_json(SCOREBOARD_URL, params={"dates": today.strftime("%Y%m%d")})
+    match_day = match["kickoff_utc"].date()
+    sb = fetch_json(SCOREBOARD_URL, params={"dates": match_day.strftime("%Y%m%d")})
     for ev in sb.get("events", []) or []:
         comps = ev.get("competitions") or []
         if not comps:
@@ -415,41 +349,81 @@ def poll_match_for_lineup(engine, match_id, event_id, home_id, away_id, home_nam
     return sides_found == 2
 
 
+def get_match(engine, match_id):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                select m.id, ht.code, at.code, ht.id, at.id, m.match_date, m.kickoff_time, m.status
+                from matches m
+                join teams ht on ht.id = m.home_team_id
+                join teams at on at.id = m.away_team_id
+                where m.id = :mid
+            """),
+            {"mid": match_id},
+        ).fetchone()
+    if row is None:
+        return None
+    mid, home_code, away_code, home_id, away_id, match_date, kickoff_time, status = row
+    kickoff_utc = datetime.combine(match_date, kickoff_time, tzinfo=timezone.utc) if kickoff_time else None
+    return {"match_id": mid, "home_code": home_code, "away_code": away_code, "home_id": home_id,
+            "away_id": away_id, "kickoff_utc": kickoff_utc, "status": status}
+
+
+def lineup_already_captured(engine, match_id, kickoff_utc):
+    """True if BOTH teams already have 11+ predicted starters written at or after (kickoff - CAPTURED_SINCE_MIN).
+    This is what lets the T-25 safety run exit at once when the T-50 run did its job."""
+    since = kickoff_utc - timedelta(minutes=CAPTURED_SINCE_MIN)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                select team_id, count(*) from predicted_lineups
+                where match_id = :mid and predicted_status = 2 and scraped_at >= :since
+                group by team_id
+            """),
+            {"mid": match_id, "since": since},
+        ).fetchall()
+    return len(rows) == 2 and all(n >= 11 for _, n in rows)
+
+
 if __name__ == "__main__":
-    teams = teams_map(engine)
-    matches = match_id_map(engine, SEASON)
-    code_to_team_id = teams  # already keyed by code
+    match_id = os.environ.get("MATCH_ID", "").strip()
+    if not match_id:
+        raise SystemExit("MATCH_ID is not set -- this script handles one match per run.")
 
-    print("=== Phase A: sync kickoff times ===", flush=True)
-    sync_kickoff_times(engine, teams, matches, SEASON)
-
-    print("\n=== Phase B: check for actionable matches ===", flush=True)
-    actionable = get_actionable_matches(engine, SEASON)
-    if not actionable:
-        print("No match within the actionable window right now -- exiting, no lineup requests made.", flush=True)
+    m = get_match(engine, match_id)
+    if m is None:
+        raise SystemExit(f"No match found with id {match_id}.")
+    if m["kickoff_utc"] is None:
+        raise SystemExit(f"Match {match_id} has no kickoff_time stored -- nothing to time against.")
+    if m["status"] == "completed":
+        print("Match already completed -- nothing to do.", flush=True)
         raise SystemExit(0)
 
-    for m in actionable:
-        home_id = code_to_team_id.get(m["home_code"])
-        away_id = code_to_team_id.get(m["away_code"])
-        home_name = m["home_code"]
-        away_name = m["away_code"]
-        print(f"\nActionable: {home_name} vs {away_name} (kickoff {m['kickoff_utc'].isoformat()})", flush=True)
+    home_name, away_name = m["home_code"], m["away_code"]
+    print(f"{home_name} vs {away_name} -- kickoff {m['kickoff_utc'].isoformat()} -- DRY_RUN={DRY_RUN}", flush=True)
 
-        event_id = find_event_id(m)
-        if event_id is None:
-            print(f"  could not find this match on ESPN's scoreboard for today -- skipping.", flush=True)
-            continue
+    if lineup_already_captured(engine, m["match_id"], m["kickoff_utc"]):
+        print("Both lineups already captured for this match -- exiting.", flush=True)
+        raise SystemExit(0)
 
-        deadline = m["kickoff_utc"] + timedelta(minutes=LATE_CUTOFF_MIN)
-        while True:
-            done = poll_match_for_lineup(engine, m["match_id"], event_id, home_id, away_id, home_name, away_name)
-            if done:
-                break
-            now = datetime.now(timezone.utc)
-            if now >= deadline:
-                print(f"  reached cutoff ({LATE_CUTOFF_MIN} min after kickoff) without a full lineup -- giving up for this match.", flush=True)
-                break
-            time.sleep(POLL_INTERVAL_SEC)
+    event_id = find_event_id(m)
+    if event_id is None:
+        raise SystemExit(f"Could not find {home_name} vs {away_name} on ESPN's scoreboard for "
+                         f"{m['kickoff_utc'].date()}.")
+
+    deadline = m["kickoff_utc"] + timedelta(minutes=LATE_CUTOFF_MIN)
+    captured = False
+    while True:
+        captured = poll_match_for_lineup(engine, m["match_id"], event_id, m["home_id"], m["away_id"],
+                                         home_name, away_name)
+        if captured:
+            break
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            print(f"  reached cutoff ({LATE_CUTOFF_MIN} min after kickoff) without a full lineup -- giving up.",
+                  flush=True)
+            break
+        time.sleep(min(POLL_INTERVAL_SEC, remaining))
 
     print("\nDone.", flush=True)
+    raise SystemExit(0 if captured else 1)
