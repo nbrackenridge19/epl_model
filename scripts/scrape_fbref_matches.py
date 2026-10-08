@@ -55,6 +55,7 @@ FBREF_SCHEDULE_URL = "https://fbref.com/en/comps/9/schedule/Premier-League-Score
 
 SLEEP_BETWEEN = (3, 6)
 MAX_RETRIES = 3
+SCHEDULE_MAX_RETRIES = 8
 USE_PROXY = True
 # Read from environment, not hardcoded -- this key was previously sitting
 # directly in this file, which is fine on your own machine but a real
@@ -126,7 +127,7 @@ TEAM_NAME_TO_CODE.update({
 })
 
 
-def get_html(url, render=False, use_premium=True):
+def get_html(url, render=False, use_premium=True, max_retries=MAX_RETRIES):
     # use_premium=False sends the request through the base proxy with NO
     # premium/ultra_premium param at all. Confirmed via ScraperAPI's own
     # support test (Aug 2026) that a plain standard-tier request against
@@ -158,7 +159,7 @@ def get_html(url, render=False, use_premium=True):
             "Chrome/124.0.0.0 Safari/537.36"
         )
     }
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, headers=headers, proxies=proxies, timeout=60, verify=False)
             if r.status_code != 200:
@@ -279,7 +280,9 @@ def fetch_schedule_table():
     the same rows. Confirmed via real ScraperAPI usage data this is
     genuinely wasteful, not just theoretically: two full ultra_premium
     requests per day for data that only needs fetching once."""
-    html = get_html(FBREF_SCHEDULE_URL, use_premium=False)
+    # Standard tier fails intermittently on this page (HTTP 500, not charged).
+    # Retry more here only -- match reports keep MAX_RETRIES.
+    html = get_html(FBREF_SCHEDULE_URL, use_premium=False, max_retries=SCHEDULE_MAX_RETRIES)
     if html is None:
         raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
     soup = BeautifulSoup(html, "lxml")
