@@ -52,8 +52,8 @@ Betting logic above is unchanged. Only the page was rebuilt. Sections, top to bo
 - Next matchweek: replaces "Today's matches". Same two-rows-per-game layout as the NHL
   page (dashed rule between the two teams, thick rule closing out the game), home row first.
   Columns: Date, Matchup (Away @ Home), Team, Bet?, $ Amount, Model %, Market %, Delta,
-  Lineup check. Bet? shows BET or the reason there is no bet (pass, too early, outside
-  betting band, awaiting lineup odds, ...).
+  Lineup check. Bet? shows BET plus the moneyline it is struck at (e.g. BET +180), or the reason there is no
+  bet (pass, too early, outside betting band, awaiting lineup odds, ...).
 - <season> at a glance: one summary row for the detail season (same columns as Past seasons,
   incl. Wallet Return).
 - <season> wallet & LogLoss over time: inline SVG (wallet $ + cumulative average LL delta on
@@ -536,18 +536,18 @@ def evaluate_side(model_prob, ml, line_type, bankroll, edge_threshold, games_pla
         return {"status": "awaiting_closing", "model_prob": model_prob, "implied_prob": implied_prob,
                 "line_type": line_type, "moneyline": ml}
 
-    if not (PROB_BAND_LOW <= model_prob <= PROB_BAND_HIGH):
-        # Outside the validated betting band -- see PROB_BAND_LOW/HIGH
-        # comment at top of file. Model still considered this and passed,
-        # same as a below-edge-threshold "pass".
-        return {"status": "outside_prob_band", "model_prob": model_prob, "implied_prob": implied_prob,
-                "line_type": line_type, "moneyline": ml}
-
     b = moneyline_to_net_odds(ml)
     kf = model_prob - (1 - model_prob) / b
 
+    # Order matters for the label: edge first, band second. A side with no edge is a plain "pass"; only a
+    # side that WOULD have been a bet on edge but whose model probability falls outside the validated
+    # betting band (see PROB_BAND_LOW/HIGH at the top of this file) is "outside_prob_band".
     if edge_threshold is None or kf < edge_threshold * 2:
         return {"status": "pass", "model_prob": model_prob, "implied_prob": implied_prob,
+                "line_type": line_type, "moneyline": ml, "kf": kf}
+
+    if not (PROB_BAND_LOW <= model_prob <= PROB_BAND_HIGH):
+        return {"status": "outside_prob_band", "model_prob": model_prob, "implied_prob": implied_prob,
                 "line_type": line_type, "moneyline": ml, "kf": kf}
 
     stake = kf * bankroll * KELLY_FRACTION
@@ -1140,9 +1140,12 @@ def render_next_matchweek(upcoming):
                 market_str = "-"
                 delta_cell = "<td>-</td>"
             stake_str = f"${ev['stake']:,.2f}" if status == "bet" else "-"
+            badge_text = BET_BADGE[status]
+            if status == "bet" and ev.get("moneyline") is not None:
+                badge_text += f" {float(ev['moneyline']):+.0f}"  # the American moneyline the bet is struck at
             html += (
                 head
-                + f"<td><span style=\"color:{BET_BADGE_COLOR[status]}; font-weight:600;\">{BET_BADGE[status]}</span></td>"
+                + f"<td><span style=\"color:{BET_BADGE_COLOR[status]}; font-weight:600;\">{badge_text}</span></td>"
                 + f"<td>{stake_str}</td>"
                 + f"<td>{mpct:.1%}</td>"
                 + f"<td>{market_str}</td>"
