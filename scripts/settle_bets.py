@@ -23,6 +23,16 @@ import os
 
 from sqlalchemy import create_engine, text
 
+import psycopg2.extensions
+
+# Postgres NUMERIC columns (odds, stake, profit, ...) come back from psycopg2 as decimal.Decimal, and Python
+# refuses to mix Decimal with float (float - Decimal / Decimal raises TypeError). Rather than casting
+# value-by-value wherever it happens to fail, convert every NUMERIC to float at the driver, once, so nothing
+# downstream ever sees a Decimal. (Float precision is fine here: odds, stakes and probabilities.)
+psycopg2.extensions.register_type(psycopg2.extensions.new_type(
+    psycopg2.extensions.DECIMAL.values, "NUMERIC_AS_FLOAT",
+    lambda value, cur: float(value) if value is not None else None))
+
 DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=280)
 
