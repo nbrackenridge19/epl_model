@@ -27,7 +27,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=280)
 
 SEASON = 2627
-STARTING_BANKROLL = 2176.93  # 2025-26's real ending bankroll -- same anchor as generate_dashboard.py
+STARTING_BANKROLL = 2500.00  # each season's bank resets to this -- same anchor as generate_dashboard.py (set 2026-10-09)
 
 
 def moneyline_profit(stake, ml, won):
