@@ -64,8 +64,8 @@ Betting logic above is unchanged. Only the page was rebuilt. Sections, top to bo
   Bets, Record, Wagered, Profit, Return and LogLoss (model / market / delta) twice -- over the
   bets placed and over all games -- and opens to a "Bets placed" and an "All games" table.
   Game tables are one row per game, away side first, with the score (A-H) and wager & result.
-- Past seasons: walk-forward backtest rows from season_backtests (unchanged source), plus
-  a Wallet Return column.
+- Past seasons: walk-forward backtest rows from season_backtests, chained from a $2,500 start in
+  2020-21 (Start Bank, End Bank, Wallet Return columns).
 
 Matchweek definitions (see get_matchweek_context). Matchweek NUMBERS are used, not dates,
 because postponed matches keep their original matchweek number but get a new date (2025-26
@@ -84,10 +84,15 @@ that season's first match finishes. Override with the DETAIL_SEASON env var (e.g
 
 Bank: in-year. Every season starts at STARTING_BANKROLL ($2,500) and compounds only with that
 season's own settled bets. Wallet Return = (ending bank - starting bank) / starting bank.
-For Past seasons, season_backtests was computed with a $2,176.93 reset per season
-(BACKTEST_STARTING_BANKROLL), so its Wallet Return is profit / 2,176.93 and the Total row is
-total profit / (seasons x 2,176.93), consistent with the dollar figures in that table. Re-run
-backtest_seasons.py on a $2,500 reset to move those onto the same basis.
+Past seasons: $2,500 invested at the start of 2020-21 (CHAIN_START_BANKROLL) with each season's
+ending bank carried into the next. season_backtests holds each season on a flat reset basis
+($2,176.93 per backtest_seasons.py); because that script sizes every stake off the running bank
+(stake = Kelly x current bank, bank updated after each bet), a season's result scales exactly
+with its starting bank, so the chain is computed here by rescaling the stored dollars -- no
+re-run needed. Start Bank / End Bank / Wagered / Profit are the chained figures; Return
+(profit / wagered), record and LogLoss are unaffected. The Total row's Wallet Return is the
+cumulative return on the original $2,500. This is separate from 2026-27, whose bank is $2,500
+for the actual betting decisions.
 
 Picks correct: each matchweek and team block also shows how many games the model and the
 market picked right (the side with the higher probability is the pick; ties go to home; a draw
@@ -99,6 +104,7 @@ Model % / Market % / LogLoss are recomputed live, as before.
 """
 
 import os
+import re
 import math
 import json
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -113,9 +119,13 @@ SEASON = 2627
 KELLY_FRACTION = 0.15
 MIN_GAMES_PLAYED = 5
 STARTING_BANKROLL = 2500.00  # each season's bank resets to this at the start of the season (set 2026-10-09)
-# season_backtests was computed with a $2,176.93 reset per season. Used only for the Wallet Return column
-# of the Past seasons table, so those percentages stay consistent with that table's dollar figures.
-BACKTEST_STARTING_BANKROLL = 2176.93
+# Past seasons: a hypothetical $2,500 invested at the start of the first backtested season (2020-21), with each
+# season's ending bank carried into the next so the table shows the effect of compounding.
+CHAIN_START_BANKROLL = 2500.00
+# season_backtests dollar figures were computed from a flat per-season reset (backtest_seasons.py's
+# STARTING_BANKROLL, recorded in each row's notes as "resets to $X"). Used only as a fallback if a row's notes
+# can't be parsed. See chain_backtest_seasons for why rescaling those figures is exact.
+BACKTEST_BASE_BANKROLL = 2176.93
 OUTPUT_PATH = "docs/index.html"  # GitHub Pages serves from /docs by default
 
 # Betting eligibility restriction (added 2026-09-03): only bet when the
@@ -657,25 +667,48 @@ def get_season_summaries(engine):
     with today's possD-drop/strtD-spline structure and [0.3,0.7]
     probability band applied at every step. Re-run backtest_seasons.py
     whenever the model or betting-eligibility logic changes, or a new
-    season completes, to keep this current. Bankroll resets to
-    BACKTEST_STARTING_BANKROLL at the start of each backtested season."""
+    season completes, to keep this current. Returned dollar figures are chained (see
+    chain_backtest_seasons) from CHAIN_START_BANKROLL."""
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
-                select season, bets, wins, losses, wagered, profit, return_pct, logloss, market_logloss
+                select season, bets, wins, losses, wagered, profit, return_pct, logloss, market_logloss, notes
                 from season_backtests order by season
             """)
         ).fetchall()
 
     summaries = []
-    for season, bets, wins, losses, wagered, profit, return_pct, logloss, market_logloss in rows:
+    for season, bets, wins, losses, wagered, profit, return_pct, logloss, market_logloss, notes in rows:
+        m = re.search(r"resets to \$([\d,]+(?:\.\d+)?)", notes or "")
+        base = float(m.group(1).replace(",", "")) if m else BACKTEST_BASE_BANKROLL
         summaries.append({
             "season": season, "bets_placed": bets, "wins": wins, "losses": losses,
             "wagered": float(wagered), "profit": float(profit),
             "return_pct": float(return_pct) if return_pct is not None else None,
             "model_logloss": float(logloss), "market_logloss": float(market_logloss),
+            "base_bankroll": base,
         })
-    return summaries
+    return chain_backtest_seasons(summaries)
+
+
+def chain_backtest_seasons(summaries, start_bank=CHAIN_START_BANKROLL):
+    """Carries each season's ending bank into the next, starting from start_bank at the first season.
+
+    Exact, not an approximation: backtest_seasons.py sizes each stake as kelly_fraction x CURRENT bank and
+    adds the result to the bank after every bet, so the bank is multiplied by (1 + stake/bank x payoff) at
+    each bet -- independent of the starting bank. Starting a season with B instead of its stored base bank
+    therefore multiplies every stake and profit by B/base. Wagered, profit and the bank figures are rescaled
+    accordingly; bet counts, record, return_pct and LogLoss do not depend on the bank and are left alone.
+    Adds start_bank / end_bank to each row."""
+    bank = start_bank
+    out = []
+    for s in sorted(summaries, key=lambda x: x["season"]):
+        k = bank / s["base_bankroll"]
+        profit = s["profit"] * k
+        out.append({**s, "wagered": s["wagered"] * k, "profit": profit,
+                    "start_bank": bank, "end_bank": bank + profit})
+        bank += profit
+    return out
 
 
 # --------------------------- instance grouping + aggregation ---------------------------
@@ -852,7 +885,7 @@ def money(v, decimals=2):
     return f"{'+' if r >= 0 else '-'}${abs(r):,.{decimals}f}"
 
 
-def summary_row_html(label, s, wallet_return_pct=None, bold=False, ll_title=None):
+def summary_row_html(label, s, wallet_return_pct=None, bold=False, ll_title=None, banks=None):
     win_pct = f"{s['wins'] / s['bets_placed']:.0%}" if s["bets_placed"] else "-"
     profit_color = "#1a7f37" if s["profit"] >= 0 else "#c0392b"
     return_str = f"{s['return_pct']:+.1%}" if s["return_pct"] is not None else "-"
@@ -866,6 +899,7 @@ def summary_row_html(label, s, wallet_return_pct=None, bold=False, ll_title=None
         wallet_cell = f"<td><span style=\"color:{wr_color}; font-weight:600;\">{wallet_return_pct:+.1%}</span></td>"
     else:
         wallet_cell = "<td>-</td>"
+    bank_cells = f"<td>${banks[0]:,.2f}</td><td>${banks[1]:,.2f}</td>" if banks else ""
     style = "font-weight:700; border-top:2px solid #ccc;" if bold else ""
     title = f" title=\"{ll_title}\"" if ll_title else ""
     return (
@@ -875,6 +909,7 @@ def summary_row_html(label, s, wallet_return_pct=None, bold=False, ll_title=None
         f"<td>${s['wagered']:,.2f}</td>"
         f"<td><span style=\"color:{profit_color}; font-weight:600;\">{money(s['profit'])}</span></td>"
         f"<td>{return_str}</td>"
+        f"{bank_cells}"
         f"{wallet_cell}"
         f"<td{title}>{model_ll}</td><td{title}>{market_ll}</td>"
         f"<td style=\"{logloss_delta_bg(delta)}\">{delta_str}</td>"
@@ -882,10 +917,12 @@ def summary_row_html(label, s, wallet_return_pct=None, bold=False, ll_title=None
     )
 
 
-def summary_table_html(header_label, rows_html):
+def summary_table_html(header_label, rows_html, bank_cols=False):
+    bank_heads = "<th>Start Bank</th><th>End Bank</th>" if bank_cols else ""
     return (
         f"<div class=\"scroll-wrap\"><table><tr><th>{header_label}</th><th>Bets</th><th>Record</th>"
         "<th>Wagered</th><th>Profit</th><th>Return</th>"
+        f"{bank_heads}"
         "<th>Wallet Return</th>"
         "<th>LogLoss</th><th>Mkt LogLoss</th><th>LL &Delta;</th></tr>"
         f"{rows_html}</table></div>"
@@ -1298,14 +1335,15 @@ def render_html(bankroll, model_version, upcoming, next_mw, detail_season, detai
 
     detail_row_html = summary_row_html(disp, detail_summary, wallet_return_pct=detail_wallet_pct)
 
-    # Past seasons: season_backtests rows. Each backtested season resets to BACKTEST_STARTING_BANKROLL, so
-    # Wallet Return = profit / BACKTEST_STARTING_BANKROLL; the Total is total profit over total starting bankrolls.
+    # Past seasons: chained season_backtests rows (see chain_backtest_seasons). Wallet Return per season =
+    # profit / start bank; the Total's Wallet Return is the cumulative return on the original start bank.
     season_rows_html = ""
     tot = {"bets_placed": 0, "wins": 0, "losses": 0, "wagered": 0.0, "profit": 0.0}
     ll_sum = ll_n = vll_sum = vll_n = 0
     for s in season_summaries:
         season_rows_html += summary_row_html(season_display(s["season"]), s,
-                                             wallet_return_pct=s["profit"] / BACKTEST_STARTING_BANKROLL)
+                                             wallet_return_pct=s["profit"] / s["start_bank"],
+                                             banks=(s["start_bank"], s["end_bank"]))
         for k in tot:
             tot[k] += s[k]
         if s["model_logloss"] is not None:
@@ -1319,9 +1357,11 @@ def render_html(bankroll, model_version, upcoming, next_mw, detail_season, detai
         tot["model_logloss"] = ll_sum / ll_n if ll_n else None
         tot["market_logloss"] = vll_sum / vll_n if vll_n else None
         tot["return_pct"] = (tot["profit"] / tot["wagered"]) if tot["wagered"] else None
-        total_wr = tot["profit"] / (BACKTEST_STARTING_BANKROLL * len(season_summaries))
+        first_bank, last_bank = season_summaries[0]["start_bank"], season_summaries[-1]["end_bank"]
+        total_wr = (last_bank - first_bank) / first_bank
         season_rows_html += summary_row_html("Total", tot, wallet_return_pct=total_wr, bold=True,
-                                             ll_title="Unweighted mean across seasons")
+                                             ll_title="Unweighted mean across seasons",
+                                             banks=(first_bank, last_bank))
 
     html = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
@@ -1346,9 +1386,10 @@ def render_html(bankroll, model_version, upcoming, next_mw, detail_season, detai
         f"<h2>{disp} &mdash; by team</h2>"
         f"{team_html}"
         "<h2>Past seasons</h2>"
-        "<div class=\"meta\">Walk-forward backtest; bankroll resets to "
-        f"${BACKTEST_STARTING_BANKROLL:,.2f} each season.</div>"
-        f"{summary_table_html('Season', season_rows_html)}"
+        "<div class=\"meta\">Walk-forward backtest. "
+        f"${CHAIN_START_BANKROLL:,.2f} invested at the start of the first season, each season's ending "
+        "bank carried into the next (compounding). Wagered and Profit are on that growing bank.</div>"
+        f"{summary_table_html('Season', season_rows_html, bank_cols=True)}"
         "</body></html>"
     )
     return html
