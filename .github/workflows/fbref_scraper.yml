@@ -7,7 +7,15 @@ name: FBref match scraper
 on:
   schedule:
     - cron: "0 8 * * *"
-  workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
+  workflow_dispatch:  # lets you trigger a manual run from the Actions tab
+    inputs:
+      schedule_tier:
+        description: "Schedule-page fetch tier (match reports are unaffected)"
+        type: choice
+        options:
+          - none
+          - ultra_premium
+        default: none
 
 jobs:
   scrape:
@@ -27,4 +35,5 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
           SCRAPERAPI_PREMIUM_LEVEL: ${{ secrets.SCRAPERAPI_PREMIUM_LEVEL }}
+          SCHEDULE_TIER_OVERRIDE: ${{ inputs.schedule_tier }}
         run: python scripts/scrape_fbref_matches.py

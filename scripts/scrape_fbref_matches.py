@@ -56,6 +56,14 @@ FBREF_SCHEDULE_URL = "https://fbref.com/en/comps/9/schedule/Premier-League-Score
 SLEEP_BETWEEN = (3, 6)
 MAX_RETRIES = 3
 SCHEDULE_MAX_RETRIES = 8
+# Manual-test override for the schedule-page fetch only. Normally unset, which
+# keeps the no-flag request. Set (via the workflow_dispatch input) to
+# "ultra_premium" to try that tier for this one fetch; scheduled runs never set it.
+SCHEDULE_TIER_OVERRIDE = os.environ.get("SCHEDULE_TIER_OVERRIDE", "").strip().lower()
+if SCHEDULE_TIER_OVERRIDE in ("none", "default"):
+    SCHEDULE_TIER_OVERRIDE = ""
+if SCHEDULE_TIER_OVERRIDE not in ("", "ultra_premium"):
+    raise SystemExit(f"Unsupported SCHEDULE_TIER_OVERRIDE: {SCHEDULE_TIER_OVERRIDE!r}")
 USE_PROXY = True
 # Read from environment, not hardcoded -- this key was previously sitting
 # directly in this file, which is fine on your own machine but a real
@@ -127,7 +135,7 @@ TEAM_NAME_TO_CODE.update({
 })
 
 
-def get_html(url, render=False, use_premium=True, max_retries=MAX_RETRIES):
+def get_html(url, render=False, use_premium=True, max_retries=MAX_RETRIES, tier_override=None):
     # use_premium=False sends the request through the base proxy with NO
     # premium/ultra_premium param at all. Confirmed via ScraperAPI's own
     # support test (Aug 2026) that a plain standard-tier request against
@@ -139,6 +147,8 @@ def get_html(url, render=False, use_premium=True, max_retries=MAX_RETRIES):
     # both sidesteps the current block and is far cheaper (1 credit vs
     # 30) regardless of how that ticket resolves.
     proxy_url = PROXY_URL if use_premium else os.environ["SCRAPERAPI_PROXY_URL"]
+    if tier_override:
+        proxy_url = _add_premium_param(os.environ["SCRAPERAPI_PROXY_URL"], tier_override)
     if render:
         # NOTE (confirmed via ScraperAPI's domain-report data, Aug 2026):
         # render=true against fbref.com has a 0% success rate across every
@@ -282,7 +292,10 @@ def fetch_schedule_table():
     requests per day for data that only needs fetching once."""
     # Standard tier fails intermittently on this page (HTTP 500, not charged).
     # Retry more here only -- match reports keep MAX_RETRIES.
-    html = get_html(FBREF_SCHEDULE_URL, use_premium=False, max_retries=SCHEDULE_MAX_RETRIES)
+    if SCHEDULE_TIER_OVERRIDE:
+        print(f"   Schedule fetch using manual tier override: {SCHEDULE_TIER_OVERRIDE}", flush=True)
+    html = get_html(FBREF_SCHEDULE_URL, use_premium=False, max_retries=SCHEDULE_MAX_RETRIES,
+                    tier_override=SCHEDULE_TIER_OVERRIDE or None)
     if html is None:
         raise RuntimeError("Could not fetch the schedule page after retries -- check proxy connectivity.")
     soup = BeautifulSoup(html, "lxml")
