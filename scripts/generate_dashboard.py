@@ -49,11 +49,16 @@ Betting logic above is unchanged. Only the page was rebuilt. Sections, top to bo
 - Header + "Needs attention" callout: the three former warning banners (missing xG,
   missing ratings, starter count != 11) merged into one box. Turns red if any
   team-match has a bad starter count (the ESPN-parsing class of problem), amber otherwise.
-- Next matchweek: replaces "Today's matches". Same two-rows-per-game layout as the NHL
-  page (dashed rule between the two teams, thick rule closing out the game), home row first.
-  Columns: Date, Matchup (Away @ Home), Team, Bet?, $ Amount, Model %, Market %, Delta,
-  Lineup check. Bet? shows BET plus the moneyline it is struck at (e.g. BET +180), or the reason there is no
-  bet (pass, too early, outside betting band, awaiting lineup odds, ...).
+- Current / Next matchweek: replaces "Today's matches". Titled "Current matchweek" while that round is in
+  progress (some games done, some not) and "Next matchweek" between rounds. Same two-rows-per-game layout as the
+  NHL page (dashed rule between the two teams, thick rule closing out the game), home row first.
+  Columns: Date, Kickoff (ET), Matchup (Away @ Home), Team, Bet?, $ Amount, Model %, Market %, Delta,
+  Lineup check. Date, Kickoff and Matchup are merged cells (not repeated per row); kickoff is stored in UTC
+  and shown in Eastern time. Bet? shows BET plus the moneyline it is struck at (e.g. BET +180), or the reason
+  there is no bet (pass, too early, outside betting band, awaiting lineup odds, ...).
+  Only games that have not been played yet are listed: once kickoff + PLAYED_AFTER (3h) has passed a game moves
+  to the results blocks, with its score shown as "awaiting result" until the FBref scraper has marked it
+  completed. The betting loop also never rewrites a bet row after kickoff.
 - <season> at a glance: one summary row for the detail season (same columns as Past seasons,
   incl. Wallet Return).
 - <season> wallet & LogLoss over time: inline SVG (wallet $ + cumulative average LL delta on
@@ -108,6 +113,7 @@ import re
 import math
 import json
 from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import patsy
 from sqlalchemy import create_engine, text
@@ -137,6 +143,17 @@ CHAIN_START_BANKROLL = 2500.00
 # can't be parsed. See chain_backtest_seasons for why rescaling those figures is exact.
 BACKTEST_BASE_BANKROLL = 2176.93
 OUTPUT_PATH = "docs/index.html"  # GitHub Pages serves from /docs by default
+
+# matches.kickoff_time is stored as UTC (epl_scheduler.py reads it as `(match_date + kickoff_time) at time zone 'UTC'`).
+EASTERN = ZoneInfo("America/New_York")
+# A match is treated as played once this long has passed since kickoff, even if the FBref scraper has not yet
+# marked it 'completed' / filled in the score (the scraper only runs once a day and FBref reports lag). Such games
+# move out of the current-matchweek table and into the results blocks, shown as "awaiting result".
+PLAYED_AFTER = timedelta(hours=3)
+
+# Fixed range of the LL-delta (right) axis in the wallet chart. Early-season variance otherwise stretches the
+# axis (it used to autoscale to roughly -0.04..+0.06); values outside the range are clipped at the panel edge.
+LL_DELTA_AXIS = (-0.02, 0.02)
 
 # Betting eligibility restriction (added 2026-09-03): only bet when the
 # model's own predicted probability falls in this band. Historical
@@ -320,12 +337,15 @@ def get_current_bankroll(engine):
 
 
 def get_matchweek_context(engine, season):
-    """(next_mw, last_mw) for a season, by matchweek NUMBER (postponed matches keep their original
+    """(next_mw, last_mw, in_progress) for a season, by matchweek NUMBER (postponed matches keep their original
     number but move date, so dates would mislead -- see module docstring).
-      last_done = highest matchweek with a completed match
-      next_mw   = lowest matchweek >= last_done with a match not yet completed (None if none left)
-      last_mw   = last_done, unless the next matchweek is that same round still in progress, in which
-                  case the previous completed round."""
+      last_done   = highest matchweek with a completed match
+      next_mw     = lowest matchweek >= last_done with a match not yet completed (None if none left)
+      last_mw     = last_done, unless the next matchweek is that same round still in progress, in which
+                    case the previous completed round.
+      in_progress = True when next_mw is that same round still in progress -- i.e. next_mw is really the
+                    CURRENT matchweek (some of its games are done, some are not). The dashboard labels the
+                    table "Current matchweek" then, and "Next matchweek" only between rounds."""
     with engine.connect() as conn:
         last_done = conn.execute(
             text("select max(matchweek) from matches where season = :season and status = 'completed'"),
@@ -343,13 +363,14 @@ def get_matchweek_context(engine, season):
                 {"season": season, "last_done": last_done},
             ).fetchone()[0]
         last_mw = last_done
-        if last_done is not None and next_mw is not None and next_mw <= last_done:
+        in_progress = last_done is not None and next_mw is not None and next_mw <= last_done
+        if in_progress:
             last_mw = conn.execute(
                 text("""select max(matchweek) from matches
                         where season = :season and status = 'completed' and matchweek < :next_mw"""),
                 {"season": season, "next_mw": next_mw},
             ).fetchone()[0]
-    return next_mw, last_mw
+    return next_mw, last_mw, in_progress
 
 
 def get_candidate_matches(engine, next_mw):
@@ -373,6 +394,42 @@ def get_candidate_matches(engine, next_mw):
             {"season": SEASON, "next_mw": next_mw},
         ).fetchall()
     return rows
+
+
+def kickoff_utc(match_date, kickoff):
+    """Kickoff as an aware UTC datetime, or None when kickoff_time is not stored yet."""
+    if match_date is None or kickoff is None:
+        return None
+    return datetime.combine(match_date, kickoff, tzinfo=timezone.utc)
+
+
+def match_is_played(match_date, kickoff, now=None):
+    """True once PLAYED_AFTER has passed since kickoff. With no stored kickoff time, falls back to the date
+    alone: played only once that date is before today (UTC), so a same-day game with an unknown time stays up."""
+    now = now or datetime.now(timezone.utc)
+    ko = kickoff_utc(match_date, kickoff)
+    if ko is not None:
+        return now >= ko + PLAYED_AFTER
+    return match_date is not None and match_date < now.date()
+
+
+def match_has_kicked_off(match_date, kickoff, now=None):
+    """True once kickoff has passed (unknown kickoff time counts as not kicked off). Used to stop the betting
+    loop from rewriting a bet's stake/odds/placed_at after the game has started."""
+    now = now or datetime.now(timezone.utc)
+    ko = kickoff_utc(match_date, kickoff)
+    return ko is not None and now >= ko
+
+
+def eastern_kickoff(match_date, kickoff):
+    """(eastern date, 'h:mm AM ET' string) for a match. Falls back to the stored date and 'TBD' when no kickoff
+    time is stored."""
+    ko = kickoff_utc(match_date, kickoff)
+    if ko is None:
+        return match_date, "TBD"
+    et = ko.astimezone(EASTERN)
+    hour12 = et.hour % 12 or 12
+    return et.date(), f"{hour12}:{et.minute:02d} {'AM' if et.hour < 12 else 'PM'} ET"
 
 
 def get_detail_season(engine):
@@ -601,16 +658,22 @@ def get_completed_match_results(engine, coefs, spline_config, season):
     Field names follow the NHL dashboard's instances so the shared rendering code lines up:
     win = the team won the match (a draw counts as not winning, as in moneyline settlement);
     bet_outcome = 'win' / 'loss' from bets.outcome, None while a placed bet is unsettled;
-    profit_dollar = bets.profit (None while unsettled)."""
+    profit_dollar = bets.profit (None while unsettled).
+
+    Also returns the games that have clearly been played (kickoff + PLAYED_AFTER has passed) but are not yet
+    marked 'completed' in `matches` -- the FBref scraper runs once a day and FBref reports lag, so a finished
+    game can sit as 'scheduled' with no score for a while. Those instances carry result_known=False, win=None,
+    no goals and no LogLoss, so they appear in the results blocks as "awaiting result" but never feed
+    LogLoss, picks-correct, or the wallet chart until the real score is in."""
     with engine.connect() as conn:
         matches = conn.execute(
             text("""
                 select m.id, m.matchweek, m.match_date, m.kickoff_time, ht.code as home_code, at.code as away_code,
-                       ht.id as home_id, at.id as away_id, m.home_goals, m.away_goals
+                       ht.id as home_id, at.id as away_id, m.home_goals, m.away_goals, m.status
                 from matches m
                 join teams ht on ht.id = m.home_team_id
                 join teams at on at.id = m.away_team_id
-                where m.season = :season and m.status = 'completed'
+                where m.season = :season and (m.status = 'completed' or m.match_date <= current_date)
                 order by m.matchweek desc, m.match_date desc
             """),
             {"season": season},
@@ -628,9 +691,15 @@ def get_completed_match_results(engine, coefs, spline_config, season):
 
     instances = []
     for (match_id, matchweek, match_date, kickoff, home_code, away_code, home_id, away_id,
-         home_goals, away_goals) in matches:
-        if home_goals is None or away_goals is None:
-            continue  # marked completed but scores not in yet -- shouldn't normally happen
+         home_goals, away_goals, status) in matches:
+        result_known = status == "completed"
+        if result_known:
+            if home_goals is None or away_goals is None:
+                continue  # marked completed but scores not in yet -- shouldn't normally happen
+        elif season != SEASON or not match_is_played(match_date, kickoff):
+            # Not completed and not clearly played yet -- belongs in the current-matchweek table. (Only the live
+            # season gets "awaiting result" rows; an unfinished match in a past season is just left out.)
+            continue
         odds = get_latest_odds(engine, match_id)
         home_ml, away_ml, line_type = odds if odds else (None, None, None)
 
@@ -642,16 +711,20 @@ def get_completed_match_results(engine, coefs, spline_config, season):
             market_prob = moneyline_to_implied_prob(ml)
             model_prob = float(model_prob) if model_prob is not None else None
             market_prob = float(market_prob) if market_prob is not None else None
-            team_goals = home_goals if is_home else away_goals
-            opp_goals = away_goals if is_home else home_goals
-            y = 1.0 if team_goals > opp_goals else 0.0
+            if result_known:
+                team_goals = home_goals if is_home else away_goals
+                opp_goals = away_goals if is_home else home_goals
+                y = 1.0 if team_goals > opp_goals else 0.0
+                win, logloss, vlogloss = team_goals > opp_goals, _logloss(model_prob, y), _logloss(market_prob, y)
+            else:
+                win, logloss, vlogloss = None, None, None  # played, score not in the database yet
             stake, bet_outcome, profit = bets_by_match_team.get((match_id, team_id), (0.0, None, None))
             instances.append({
                 "game_id": match_id, "matchweek": matchweek, "season": season, "date": match_date,
                 "kickoff": kickoff, "team": team_code, "opp": opp_code, "home": is_home,
-                "win": team_goals > opp_goals,
+                "win": win, "result_known": result_known,
                 "model_pct": model_prob, "mlpct": market_prob,
-                "logloss": _logloss(model_prob, y), "vlogloss": _logloss(market_prob, y),
+                "logloss": logloss, "vlogloss": vlogloss,
                 "bets_fire": stake > 0, "stake_dollar": stake, "bet_outcome": bet_outcome,
                 "profit_dollar": profit,
                 "home_goals": home_goals, "away_goals": away_goals,
@@ -757,6 +830,8 @@ def build_bank_days(instances, start_bank):
     starting from the season's starting bankroll. Days with no settled bet carry a result of 0."""
     by_date = {}
     for x in instances:
+        if not x.get("result_known", True):
+            continue  # played but score not in yet -- no day on the chart until it is
         by_date.setdefault(x["date"], 0.0)
         if x["bets_fire"] and x["bet_outcome"] in ("win", "loss"):
             by_date[x["date"]] += x["profit_dollar"] or 0.0
@@ -821,6 +896,8 @@ def pick_accuracy(pairs):
     mc = me = kc = ke = 0
     for p in pairs:
         a, h = p["away"], p["home"]
+        if a["win"] is None or h["win"] is None:
+            continue  # played but score not in yet -- neither source's pick can be judged
         if a["model_pct"] is not None and h["model_pct"] is not None:
             me += 1
             picked = h if h["model_pct"] >= a["model_pct"] else a
@@ -871,6 +948,8 @@ STYLE = (
     ".nested[open] summary::before { content: '\\25BE'; } "
     "table.upcoming tr.team-top td { border-bottom: 1px dashed #aaa; } "
     "table.upcoming tr.game-end td { border-bottom: 3px solid #8a8f98; } "
+    "table.upcoming tr.team-top td.merged, table.upcoming tr.game-end td.merged "
+    "{ border-bottom: 3px solid #8a8f98; vertical-align: middle; } "
     "table.detail { border-radius: 0; margin: 0; box-shadow: none; } "
     "table.detail th, table.detail td { padding: 8px; white-space: nowrap; } "
     "@media (max-width: 480px) { th, td { font-size: 12px; padding: 8px 4px; } }"
@@ -963,8 +1042,9 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
     Two stacked panels sharing one x axis that spans the FULL season (first to last fixture); lines and
     bars stop at the last completed match day.
       Top panel    -- in-year wallet $ (left axis, green; starts at the season's starting bankroll) and
-                      cumulative average LogLoss delta (right axis, purple). The dashed purple line is the
-                      LL-delta zero line: below it the model has beaten the market, above it the market has
+                      cumulative average LogLoss delta (right axis, purple, fixed at LL_DELTA_AXIS so early-season
+                      swings don't stretch it; values outside are clipped at the panel edge). The dashed purple
+                      line is the LL-delta zero line: below it the model has beaten the market, above it the market has
                       beaten the model.
       Bottom panel -- each day's total settled $ result (green up / red down).
     bank_days: [(date, bank_at_end_of_day, result_dollars)]; ll_delta_series: [(date, cumulative avg delta)]."""
@@ -1023,10 +1103,13 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
                    f'dominant-baseline="middle">${v:,.0f}</text>')
 
     # ---- top panel: LL delta (right) ----
-    delta_vals = [v for _, v in ll_delta_series] + [0.0]
-    d_lo, d_hi, d_ticks, d_step = _nice_axis(min(delta_vals), max(delta_vals), min_span=0.02)
+    # Fixed range (LL_DELTA_AXIS), not autoscaled: early-season variance would otherwise stretch the axis well
+    # beyond what matters over a full season. Anything outside the range is clipped at the panel edge below.
+    d_lo, d_hi = LL_DELTA_AXIS
+    d_step = 0.01
+    d_ticks = [round(d_lo + k * d_step, 10) for k in range(int(round((d_hi - d_lo) / d_step)) + 1)]
     y_d = y_mapper(p1_top, p1_h, d_lo, d_hi)
-    decimals = 3 if d_step >= 0.001 else 4
+    decimals = 3
     svg.append(f'<line x1="{left + plot_w}" x2="{left + plot_w}" y1="{p1_top}" y2="{p1_top + p1_h}" '
                f'stroke="{AXIS}" />')
     for v in d_ticks:
@@ -1046,7 +1129,11 @@ def render_wallet_chart_svg(bank_days, ll_delta_series, start_bank, season_start
     svg.append('<polyline points="' + " ".join(f"{x_of(d):.1f},{y_w(v):.1f}" for d, v in wallet_pts) +
                '" fill="none" stroke="#1a7f37" stroke-width="2" />')
     if ll_delta_series:
-        svg.append('<polyline points="' + " ".join(f"{x_of(d):.1f},{y_d(v):.1f}" for d, v in ll_delta_series) +
+        # clipPath keeps the line inside the top panel when the cumulative delta leaves the fixed axis range
+        svg.append(f'<clipPath id="ll-clip"><rect x="{left}" y="{p1_top}" width="{plot_w}" height="{p1_h}" />'
+                   f'</clipPath>')
+        svg.append('<polyline clip-path="url(#ll-clip)" points="' +
+                   " ".join(f"{x_of(d):.1f},{y_d(v):.1f}" for d, v in ll_delta_series) +
                    '" fill="none" stroke="#6a3fb5" stroke-width="2" />')
 
     # ---- bottom panel: daily result bars ----
@@ -1107,19 +1194,37 @@ def lineup_check_cell(msg):
 
 
 def render_next_matchweek(upcoming):
-    """upcoming: [{match_date, home_code, away_code, home: evaluation, away: evaluation}], in kickoff order.
-    Two rows per game, home row first. A dashed rule separates the two teams in a game (first row =
-    team-top); a thick rule closes out the game (second row = game-end)."""
+    """upcoming: [{match_date, kickoff, home_code, away_code, home: evaluation, away: evaluation}], in kickoff
+    order. Two rows per game, home row first. A dashed rule separates the two teams in a game (first row =
+    team-top); a thick rule closes out the game (second row = game-end).
+
+    Date, Kickoff (ET) and Matchup are merged cells (rowspan) so they are not repeated: Matchup and Kickoff span
+    the game's two rows, Date spans every row of every game on that (Eastern) date. The merged cells carry
+    their own thick bottom border (class "merged") because a rowspan cell does not inherit the row's rule.
+    Kickoff times are stored in UTC and shown in Eastern time."""
     if not upcoming:
         return "<p class=\"meta\">No upcoming matches.</p>"
+    # Eastern date + time per game, and how many games share each (consecutive) Eastern date.
+    et = [eastern_kickoff(g["match_date"], g.get("kickoff")) for g in upcoming]
+    games_on_date = {}
+    for et_date, _ in et:
+        games_on_date[et_date] = games_on_date.get(et_date, 0) + 1
     html = ""
-    for g in upcoming:
+    prev_date = None
+    for g, (et_date, et_time) in zip(upcoming, et):
         matchup = f"{g['away_code'].upper()} @ {g['home_code'].upper()}"
         for is_home in (True, False):
             ev = g["home"] if is_home else g["away"]
             team = g["home_code"] if is_home else g["away_code"]
             row_cls = "team-top" if is_home else "game-end"
-            head = (f"<tr class=\"{row_cls}\"><td>{g['match_date']}</td><td>{matchup}</td>"
+            merged = ""
+            if is_home:
+                if et_date != prev_date:
+                    merged += (f"<td class=\"merged\" rowspan=\"{2 * games_on_date[et_date]}\">{et_date}</td>")
+                merged += (f"<td class=\"merged\" rowspan=\"2\">{et_time}</td>"
+                           f"<td class=\"merged\" rowspan=\"2\">{matchup}</td>")
+                prev_date = et_date  # later games on this date add no date cell
+            head =(f"<tr class=\"{row_cls}\">{merged}"
                     f"<td>{team.upper()} {'(H)' if is_home else '(A)'}</td>")
             lineup_td = lineup_check_cell(ev.get("lineup_check"))
             status = ev["status"]
@@ -1154,7 +1259,8 @@ def render_next_matchweek(upcoming):
                 + "</tr>"
             )
     return (
-        "<div class=\"scroll-wrap\"><table class=\"upcoming\"><tr><th>Date</th><th>Matchup (Away @ Home)</th>"
+        "<div class=\"scroll-wrap\"><table class=\"upcoming\"><tr><th>Date</th><th>Kickoff (ET)</th>"
+        "<th>Matchup (Away @ Home)</th>"
         "<th>Team</th><th>Bet?</th><th>$ Amount</th><th>Model %</th><th>Market %</th><th>Delta</th>"
         "<th>Lineup check</th></tr>"
         + html + "</table></div>"
@@ -1185,6 +1291,8 @@ def game_row_html(pair):
     h_mktpct = f"{home['mlpct']:.1%}" if home["mlpct"] is not None else "-"
     if away["away_goals"] is not None and away["home_goals"] is not None:
         score = f"{away['away_goals']}-{away['home_goals']}"
+    elif not away.get("result_known", True):
+        score = "<span class=\"tag\">awaiting result</span>"  # played, but the score is not in the database yet
     else:
         score = "-"
     wagers = []
@@ -1332,8 +1440,9 @@ def season_display(season):
 
 def render_html(bankroll, model_version, upcoming, next_mw, detail_season, detail_summary, detail_wallet_pct,
                 chart_svg, last_mw, last_instances, week_groups, team_groups, pairs_by_game_id,
-                season_summaries, callout_html):
+                season_summaries, callout_html, mw_in_progress=False):
     disp = season_display(detail_season)
+    next_title = "Current matchweek" if mw_in_progress else "Next matchweek"
     next_label = f" (Matchweek {next_mw})" if next_mw is not None else ""
     last_label = f" (Matchweek {last_mw})" if last_mw is not None else ""
 
@@ -1386,7 +1495,7 @@ def render_html(bankroll, model_version, upcoming, next_mw, detail_season, detai
         f"Model version fit {model_version[1].strftime('%Y-%m-%d')} &middot; "
         f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>"
         f"{callout_html}"
-        f"<h2>Next matchweek{next_label}</h2>"
+        f"<h2>{next_title}{next_label}</h2>"
         f"{render_next_matchweek(upcoming)}"
         f"<h2>{disp} at a glance</h2>"
         f"{summary_table_html('Season', detail_row_html)}"
@@ -1418,8 +1527,8 @@ if __name__ == "__main__":
     print(f"Current bankroll: ${bankroll:,.2f}")
     print(f"Using model fit {version[1]}, edge threshold {edge_threshold}")
 
-    next_mw, _ = get_matchweek_context(engine, SEASON)
-    print(f"Next matchweek: {next_mw}")
+    next_mw, _, mw_in_progress = get_matchweek_context(engine, SEASON)
+    print(f"{'Current' if mw_in_progress else 'Next'} matchweek: {next_mw}")
 
     matches = get_candidate_matches(engine, next_mw)
     print(f"Found {len(matches)} candidate matches (next matchweek, today, or a posted lineup).")
@@ -1431,9 +1540,14 @@ if __name__ == "__main__":
     with engine.begin() as conn:
         for m in matches:
             match_id, match_date, kickoff, matchweek, home_code, away_code, home_id, away_id = m
+            if match_is_played(match_date, kickoff):
+                # Already played (kickoff + PLAYED_AFTER passed) but not yet marked completed: it is listed in
+                # the results blocks as "awaiting result" instead (see get_completed_match_results), not here.
+                continue
+            kicked_off = match_has_kicked_off(match_date, kickoff)
             odds = get_bet_odds(engine, match_id)
             home_ml, away_ml, line_type = odds if odds else (None, None, None)
-            game = {"match_id": match_id, "match_date": match_date, "matchweek": matchweek,
+            game = {"match_id": match_id, "match_date": match_date, "kickoff": kickoff, "matchweek": matchweek,
                     "home_code": home_code, "away_code": away_code}
 
             for team_id, team_code, ml, is_home in [
@@ -1449,7 +1563,10 @@ if __name__ == "__main__":
                 })
                 game["home" if is_home else "away"] = evaluation
 
-                if evaluation["status"] in ("bet", "pass", "outside_prob_band"):
+                # Never rewrite a bet row once the game has kicked off: record_bet overwrites stake, odds_used and
+                # placed_at, and the stake is sized off the CURRENT bank, so re-running after a game started (and
+                # after other bets have settled) would quietly change what was staked on it.
+                if evaluation["status"] in ("bet", "pass", "outside_prob_band") and not kicked_off:
                     record_bet(conn, match_id, team_id, evaluation)
             upcoming.append(game)
 
@@ -1465,7 +1582,7 @@ if __name__ == "__main__":
     team_groups = sorted(group_by(detail_instances, lambda x: x["team"]).items(), key=lambda kv: kv[0])
     detail_summary = aggregate(detail_instances)
 
-    _, last_mw = get_matchweek_context(engine, detail_season)
+    _, last_mw, _ = get_matchweek_context(engine, detail_season)
     last_instances = [x for x in detail_instances if x["matchweek"] == last_mw] if last_mw is not None else []
 
     start_bank = season_start_bankroll(detail_season)
@@ -1493,5 +1610,5 @@ if __name__ == "__main__":
     with open(OUTPUT_PATH, "w") as f:
         f.write(render_html(bankroll, version, upcoming, next_mw, detail_season, detail_summary,
                             detail_wallet_pct, chart_svg, last_mw, last_instances, week_groups, team_groups,
-                            pairs_by_game_id, season_summaries, callout_html))
+                            pairs_by_game_id, season_summaries, callout_html, mw_in_progress))
     print(f"Dashboard written to {OUTPUT_PATH}")
