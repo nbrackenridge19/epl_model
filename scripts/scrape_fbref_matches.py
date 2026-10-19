@@ -38,7 +38,7 @@ import os
 import re
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 import urllib3
@@ -56,6 +56,16 @@ FBREF_SCHEDULE_URL = "https://fbref.com/en/comps/9/schedule/Premier-League-Score
 SLEEP_BETWEEN = (3, 6)
 MAX_RETRIES = 3
 SCHEDULE_MAX_RETRIES = 8
+# Match-report fetches get the same 8 attempts. ScraperAPI is returning HTTP 500 on roughly half of
+# ultra_premium attempts (failed requests are not charged), so 3 attempts left ~1 report in 9 unfetched --
+# on 2026-10-18 that dropped Man City v Ipswich and Newcastle v Villa. Safe now that a run only fetches a
+# handful of reports (see RECHECK_COMPLETED_DAYS).
+REPORT_MAX_RETRIES = 8
+# A match already 'completed' in the database is only re-fetched (and re-written) while its match date is
+# within this many days -- FBref occasionally corrects minutes/lineups shortly after a report goes up. Older
+# completed matches are skipped. Before this, every run re-fetched EVERY completed report of the season
+# (65 on 2026-10-18, ~2 hours, and growing by a matchweek each week).
+RECHECK_COMPLETED_DAYS = 3
 # Manual-test override for the schedule-page fetch only. Normally unset, which
 # keeps the no-flag request. Set (via the workflow_dispatch input) to
 # "ultra_premium" to try that tier for this one fetch; scheduled runs never set it.
@@ -202,10 +212,21 @@ def teams_map(engine):
 def match_id_map(engine, season):
     with engine.connect() as conn:
         rows = conn.execute(
-            text("select id, source_lgame, home_team_id, away_team_id, status from matches where season = :season"),
+            text("select id, source_lgame, home_team_id, away_team_id, status, match_date "
+                 "from matches where season = :season"),
             {"season": season},
         ).fetchall()
-    return {lg: (mid, h, a, st) for mid, lg, h, a, st in rows}
+    return {lg: (mid, h, a, st, md) for mid, lg, h, a, st, md in rows}
+
+
+def should_skip_report(status, match_date, today=None):
+    """True for a match that is already 'completed' and whose match date is more than RECHECK_COMPLETED_DAYS
+    old: its data is final, so fetching the report again only burns ScraperAPI credits and run time. Anything
+    not yet completed (including a match that failed on an earlier run) is never skipped."""
+    if status != "completed" or match_date is None:
+        return False
+    today = today or datetime.now(timezone.utc).date()
+    return match_date < today - timedelta(days=RECHECK_COMPLETED_DAYS)
 
 
 def get_or_create_player(conn, name, team_id):
@@ -291,7 +312,7 @@ def fetch_schedule_table():
     genuinely wasteful, not just theoretically: two full ultra_premium
     requests per day for data that only needs fetching once."""
     # Standard tier fails intermittently on this page (HTTP 500, not charged).
-    # Retry more here only -- match reports keep MAX_RETRIES.
+    # (Match reports use REPORT_MAX_RETRIES, set separately.)
     if SCHEDULE_TIER_OVERRIDE:
         print(f"   Schedule fetch using manual tier override: {SCHEDULE_TIER_OVERRIDE}", flush=True)
     html = get_html(FBREF_SCHEDULE_URL, use_premium=False, max_retries=SCHEDULE_MAX_RETRIES,
@@ -515,7 +536,7 @@ def build_player_records(starters, bench, stats_rows):
 
 
 def scrape_match_report(url):
-    html = get_html(url)
+    html = get_html(url, max_retries=REPORT_MAX_RETRIES)
     if html is None:
         raise RuntimeError(f"Could not fetch {url} after retries.")
     soup = BeautifulSoup(html, "lxml")
@@ -565,14 +586,17 @@ def process_match(conn, teams, matches, report):
 
     home_id, away_id = teams.get(home_code), teams.get(away_code)
     match_entry = None
-    for lg, (mid, h, a, st) in matches.items():
+    for lg, (mid, h, a, st, md) in matches.items():
         if h == home_id and a == away_id:
-            match_entry = (mid, st)
+            match_entry = (mid, st, md)
             break
     if match_entry is None:
         print(f"  SKIP: no matching database row for {report['home']} vs {report['away']}", flush=True)
         return
-    match_id, current_status = match_entry
+    match_id, current_status, match_date = match_entry
+
+    if should_skip_report(current_status, match_date):
+        return "skipped"  # already completed and past the recheck window -- nothing new to fetch
 
     data = scrape_match_report(report["report_url"])
 
@@ -651,11 +675,15 @@ if __name__ == "__main__":
         reports = reports[::step][:MATCH_LIMIT]
         print(f"Sampling {len(reports)} matches spread across the season.", flush=True)
 
+    skipped = 0
     for report in reports:
         with engine.begin() as conn:
             try:
-                process_match(conn, teams, matches, report)
+                if process_match(conn, teams, matches, report) == "skipped":
+                    skipped += 1
             except Exception as e:
                 print(f"  ERROR on {report['home']} vs {report['away']}: {e}", flush=True)
 
+    print(f"Skipped {skipped} already-completed matches older than {RECHECK_COMPLETED_DAYS} days "
+          f"(fetched {len(reports) - skipped}).", flush=True)
     print("Done.")
