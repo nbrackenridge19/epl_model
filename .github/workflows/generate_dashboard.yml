@@ -32,6 +32,17 @@ jobs:
       - name: Install dependencies
         run: pip install "sqlalchemy<2.1" psycopg2-binary patsy scipy
 
+      # Settle any finished games first (fills in outcome/profit on bets whose match is now 'completed').
+      # settle_bets.py is idempotent -- it only touches bets whose outcome is still null -- so running it here every
+      # time is harmless. Without this, a bet stays "pending" on the dashboard until the once-a-day 08:00 UTC
+      # settle_bets.yml run, which fires at the same minute as the FBref scraper and so often runs before the
+      # scraper has marked the match completed (-> another full day of "pending"). Settling here also means the
+      # bankroll used to size new stakes includes results as soon as they are in.
+      - name: Settle finished bets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/settle_bets.py
+
       - name: Generate dashboard
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
