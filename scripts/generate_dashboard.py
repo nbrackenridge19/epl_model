@@ -68,7 +68,8 @@ Betting logic above is unchanged. Only the page was rebuilt. Sections, top to bo
 - <season> by matchweek / by team: collapsible blocks. Each block's summary row shows
   Bets, Record, Wagered, Profit, Return and LogLoss (model / market / delta) twice -- over the
   bets placed and over all games -- and opens to a "Bets placed" and an "All games" table.
-  Game tables are one row per game, away side first, with the score (A-H) and wager & result.
+  Game tables are one row per game, away side first, with the score (A-H), wager & result (bets only),
+  and a Model Result / Market Result column each (check / x / dash, see "Picks correct" below).
 - Past seasons: walk-forward backtest rows from season_backtests, chained from a $2,500 start in
   2020-21 (Start Bank, End Bank, Wallet Return columns).
 
@@ -103,6 +104,12 @@ Picks correct: each matchweek and team block also shows how many games the model
 market picked right (the side with the higher probability is the pick; ties go to home; a draw
 counts against whichever side was picked) -- same definition as the old matchweek summaries.
 Games where either side lacks a probability are left out of that block's denominator.
+The Model Result / Market Result columns in every game table (Bets placed and All games, in the
+by-matchweek, by-team and Last matchweek blocks) show the same per-game verdict (check = the picked side won,
+x = it did not, dash = no pick could be judged), so the x/y counts tie out to the rows below.
+
+Dollar amounts are shown in whole dollars throughout; decimals are kept only for LogLoss, return % and
+Model / Market %. The Updated stamp is Eastern time, 12-hour.
 
 All figures for the detail season come from the real `bets` table (stake, outcome, profit);
 Model % / Market % / LogLoss are recomputed live, as before.
@@ -430,6 +437,13 @@ def eastern_kickoff(match_date, kickoff):
     et = ko.astimezone(EASTERN)
     hour12 = et.hour % 12 or 12
     return et.date(), f"{hour12}:{et.minute:02d} {'AM' if et.hour < 12 else 'PM'} ET"
+
+
+def updated_stamp_et(now=None):
+    """'YYYY-MM-DD h:mm AM/PM ET' for the dashboard's Updated stamp (Eastern, 12-hour; handles EST/EDT)."""
+    et = (now or datetime.now(timezone.utc)).astimezone(EASTERN)
+    hour12 = et.hour % 12 or 12
+    return f"{et:%Y-%m-%d} {hour12}:{et.minute:02d} {'AM' if et.hour < 12 else 'PM'} ET"
 
 
 def get_detail_season(engine):
@@ -888,6 +902,20 @@ def aggregate(instances):
     }
 
 
+def pick_result(pair, source):
+    """Straight-up pick check for one game from one source ('model_pct' or 'mlpct'): the pick is the side
+    with the higher win probability (ties go to home). Returns (True, team) if that side won, (False, team)
+    if it did not (a draw counts as not won), or None when the pick can't be judged (a side lacks a
+    probability from this source, or the score isn't in yet)."""
+    a, h = pair["away"], pair["home"]
+    if a["win"] is None or h["win"] is None:
+        return None
+    if a[source] is None or h[source] is None:
+        return None
+    picked = h if h[source] >= a[source] else a
+    return bool(picked["win"]), picked["team"]
+
+
 def pick_accuracy(pairs):
     """Picks correct, Model vs Market, over completed games. A 'pick' is the side with the higher win
     probability (ties go to the home side); it is correct only if that side won, so a draw counts as
@@ -895,19 +923,14 @@ def pick_accuracy(pairs):
     toward a source if both sides have a probability from it."""
     mc = me = kc = ke = 0
     for p in pairs:
-        a, h = p["away"], p["home"]
-        if a["win"] is None or h["win"] is None:
-            continue  # played but score not in yet -- neither source's pick can be judged
-        if a["model_pct"] is not None and h["model_pct"] is not None:
+        m = pick_result(p, "model_pct")
+        if m is not None:
             me += 1
-            picked = h if h["model_pct"] >= a["model_pct"] else a
-            if picked["win"]:
-                mc += 1
-        if a["mlpct"] is not None and h["mlpct"] is not None:
+            mc += m[0]
+        k = pick_result(p, "mlpct")
+        if k is not None:
             ke += 1
-            picked = h if h["mlpct"] >= a["mlpct"] else a
-            if picked["win"]:
-                kc += 1
+            kc += k[0]
     return mc, me, kc, ke
 
 
@@ -968,8 +991,8 @@ def logloss_delta_bg(delta, scale=0.04):
     return f"background:rgba({rgb},{alpha:.2f});"
 
 
-def money(v, decimals=2):
-    """Signed dollar figure. Rounds first so a tiny negative never renders as '-$0.00'."""
+def money(v, decimals=0):
+    """Signed dollar figure, whole dollars by default. Rounds first so a tiny negative never renders as '-$0'."""
     r = round(v, decimals)
     return f"{'+' if r >= 0 else '-'}${abs(r):,.{decimals}f}"
 
@@ -988,14 +1011,14 @@ def summary_row_html(label, s, wallet_return_pct=None, bold=False, ll_title=None
         wallet_cell = f"<td><span style=\"color:{wr_color}; font-weight:600;\">{wallet_return_pct:+.1%}</span></td>"
     else:
         wallet_cell = "<td>-</td>"
-    bank_cells = f"<td>${banks[0]:,.2f}</td><td>${banks[1]:,.2f}</td>" if banks else ""
+    bank_cells = f"<td>${banks[0]:,.0f}</td><td>${banks[1]:,.0f}</td>" if banks else ""
     style = "font-weight:700; border-top:2px solid #ccc;" if bold else ""
     title = f" title=\"{ll_title}\"" if ll_title else ""
     return (
         f"<tr style=\"{style}\">"
         f"<td>{label}</td><td>{s['bets_placed']}</td>"
         f"<td>{s['wins']}-{s['losses']} ({win_pct})</td>"
-        f"<td>${s['wagered']:,.2f}</td>"
+        f"<td>${s['wagered']:,.0f}</td>"
         f"<td><span style=\"color:{profit_color}; font-weight:600;\">{money(s['profit'])}</span></td>"
         f"<td>{return_str}</td>"
         f"{bank_cells}"
@@ -1244,7 +1267,7 @@ def render_next_matchweek(upcoming):
             else:
                 market_str = "-"
                 delta_cell = "<td>-</td>"
-            stake_str = f"${ev['stake']:,.2f}" if status == "bet" else "-"
+            stake_str = f"${ev['stake']:,.0f}" if status == "bet" else "-"
             badge_text = BET_BADGE[status]
             if status == "bet" and ev.get("moneyline") is not None:
                 badge_text += f" {float(ev['moneyline']):+.0f}"  # the American moneyline the bet is struck at
@@ -1281,6 +1304,17 @@ def team_label(code, model_pct, mktpct, fired):
     return f"<span style=\"{style}\">{code.upper()}</span>"
 
 
+def pick_mark_html(result):
+    """Light green check / light red x for a straight-up pick (hover shows the team picked); a dash when the
+    pick can't be judged (see pick_result). These marks tie out to the 'Picks Correct' counts in the block summary."""
+    if result is None:
+        return "<span class=\"tag\">-</span>"
+    won, team = result
+    if won:
+        return f"<span title=\"Picked {team.upper()}\" style=\"color:#5fb374; font-weight:700;\">&#10003;</span>"
+    return f"<span title=\"Picked {team.upper()}\" style=\"color:#e57f76; font-weight:700;\">&#10007;</span>"
+
+
 def game_row_html(pair):
     away, home = pair["away"], pair["home"]
     away_label = team_label(away["team"], away["model_pct"], away["mlpct"], away["bets_fire"])
@@ -1304,9 +1338,11 @@ def game_row_html(pair):
                 result_str, result_color = "lost", "#c0392b"
             else:
                 result_str, result_color = "pending", "#b8860b"  # placed but not yet settled
-            wagers.append(f"{side['team'].upper()} ${side['stake_dollar']:,.2f} &mdash; "
+            wagers.append(f"{side['team'].upper()} ${side['stake_dollar']:,.0f} &mdash; "
                           f"<span style=\"color:{result_color}; font-weight:600;\">{result_str}</span>")
     wager_html = "; ".join(wagers) if wagers else "<span class=\"tag\">-</span>"
+    model_result_html = pick_mark_html(pick_result(pair, "model_pct"))
+    market_result_html = pick_mark_html(pick_result(pair, "mlpct"))
     return (
         "<tr>"
         f"<td>{pair['date']}</td>"
@@ -1315,6 +1351,8 @@ def game_row_html(pair):
         f"<td>{a_mktpct} / {h_mktpct}</td>"
         f"<td>{score}</td>"
         f"<td>{wager_html}</td>"
+        f"<td>{model_result_html}</td>"
+        f"<td>{market_result_html}</td>"
         "</tr>"
     )
 
@@ -1326,7 +1364,8 @@ def games_table_html(pairs):
     return (
         "<div class=\"scroll-wrap\">"
         "<table class=\"detail\"><tr><th>Date</th><th>Matchup (Away @ Home)</th>"
-        "<th>Model % (A/H)</th><th>Market % (A/H)</th><th>Score (A-H)</th><th>Wager &amp; Result</th></tr>"
+        "<th>Model % (A/H)</th><th>Market % (A/H)</th><th>Score (A-H)</th><th>Wager &amp; Result</th>"
+        "<th>Model Result</th><th>Market Result</th></tr>"
         f"{rows}</table></div>"
     )
 
@@ -1378,7 +1417,7 @@ def render_group_block(label, instances, pairs):
         f"<div class=\"row-grid\" style=\"grid-template-columns:{ROW_GRID_COLS};\">"
         f"<div class=\"block-title\">{label}</div>"
         f"<div>{s['bets_placed']}</div><div>{record}</div>"
-        f"<div>${s['wagered']:,.2f}</div>"
+        f"<div>${s['wagered']:,.0f}</div>"
         f"<div style=\"color:{profit_color}; font-weight:600;\">{money(s['profit'])}</div>"
         f"<div>{return_str}</div>"
         f"<div>{model_picks}</div><div>{market_picks}</div>"
@@ -1491,9 +1530,9 @@ def render_html(bankroll, model_version, upcoming, next_mw, detail_season, detai
         "<title>EPL Model Dashboard</title>"
         f"<style>{STYLE}</style></head><body>"
         "<h1>EPL Model Dashboard</h1>"
-        f"<div class=\"meta\">Bankroll: ${bankroll:,.2f} &middot; "
+        f"<div class=\"meta\">Bankroll: ${bankroll:,.0f} &middot; "
         f"Model version fit {model_version[1].strftime('%Y-%m-%d')} &middot; "
-        f"Updated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>"
+        f"Updated {updated_stamp_et()}</div>"
         f"{callout_html}"
         f"<h2>{next_title}{next_label}</h2>"
         f"{render_next_matchweek(upcoming)}"
@@ -1509,7 +1548,7 @@ def render_html(bankroll, model_version, upcoming, next_mw, detail_season, detai
         f"{team_html}"
         "<h2>Past seasons</h2>"
         "<div class=\"meta\">Walk-forward backtest. "
-        f"${CHAIN_START_BANKROLL:,.2f} invested at the start of the first season, each season's ending "
+        f"${CHAIN_START_BANKROLL:,.0f} invested at the start of the first season, each season's ending "
         "bank carried into the next (compounding). Wagered and Profit are on that growing bank.</div>"
         f"{summary_table_html('Season', season_rows_html, bank_cols=True)}"
         "</body></html>"
