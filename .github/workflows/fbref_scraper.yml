@@ -4,6 +4,10 @@ name: FBref match scraper
 # runs once daily, mid-morning UK time, to catch anything from the
 # previous day(s) of matches. cron times are always UTC; 8:00 UTC is
 # roughly 8-9am UK time depending on daylight saving.
+#
+# Schedule-page fetch tier: scheduled runs use ultra_premium (the
+# no-flag request was failing ~97% of the time from 2026-10-27 onward).
+# Manual runs can pick "none" to test the no-flag request instead.
 on:
   schedule:
     - cron: "0 8 * * *"
@@ -13,9 +17,9 @@ on:
         description: "Schedule-page fetch tier (match reports are unaffected)"
         type: choice
         options:
-          - none
           - ultra_premium
-        default: none
+          - none
+        default: ultra_premium
 
 jobs:
   scrape:
@@ -35,5 +39,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SCRAPERAPI_PROXY_URL: ${{ secrets.SCRAPERAPI_PROXY_URL }}
           SCRAPERAPI_PREMIUM_LEVEL: ${{ secrets.SCRAPERAPI_PREMIUM_LEVEL }}
-          SCHEDULE_TIER_OVERRIDE: ${{ inputs.schedule_tier }}
+          # Scheduled runs have no inputs, so they fall back to ultra_premium.
+          # A manual run's explicit choice (including "none") is used as-is.
+          SCHEDULE_TIER_OVERRIDE: ${{ inputs.schedule_tier || 'ultra_premium' }}
         run: python scripts/scrape_fbref_matches.py
