@@ -10,6 +10,13 @@ both genuinely new players (transfers, signings, academy graduates --
 no rating history ever existed) and known players who transferred clubs
 (prior history exists, just not for their new team this season).
 
+Also finds players in a posted lineup (starter or bench) for an upcoming
+match whose row EXISTS but whose usable rating is still NULL -- rating_a
+after the season's EA FC release date, rating_p before it. Those rows are
+updated in place when you save. Without this second check such players
+(e.g. one the EA FC import never matched) were invisible here and on the
+dashboard, because both only asked whether a row existed.
+
 Prompts for rating_l, rating_a, age, and position -- NOT rating_p.
 rating_p is the age/position aging-curve projection, computed by the
 existing separate process from rating_l -- typing a number in for it
@@ -46,28 +53,67 @@ DEFAULT_RATING_NO_CARD = 55  # project convention: genuinely no rating history a
 
 
 def get_missing_ratings(engine):
+    """Two kinds of player, both silently dropped from the lineup averages: (1) no player_ratings row at all for
+    (player, team, season); (2) a row exists but the rating the model actually uses for an upcoming match
+    (rating_a on/after the season's EA FC release date, rating_p before it -- same switch and same row pick as
+    v_team_lineup_ratings_predicted) is NULL, for a starter or a bench player. Kind (2) used to be invisible
+    here because the old check only asked whether a row existed."""
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
-                select distinct p.id as player_id, p.fbref_name, t.id as team_id, t.code as team_code
-                from (
-                    select player_id, team_id from player_match_appearances pma
-                    join matches m on m.id = pma.match_id where m.season = :season
+                select player_id, fbref_name, team_id, team_code from (
+                    select distinct p.id as player_id, p.fbref_name, t.id as team_id, t.code as team_code
+                    from (
+                        select player_id, team_id from player_match_appearances pma
+                        join matches m on m.id = pma.match_id where m.season = :season
+                        union
+                        select player_id, team_id from predicted_lineups pl
+                        join matches m on m.id = pl.match_id where m.season = :season
+                    ) seen
+                    join players p on p.id = seen.player_id
+                    join teams t on t.id = seen.team_id
+                    where not exists (
+                        select 1 from player_ratings pr
+                        where pr.player_id = seen.player_id and pr.team_id = seen.team_id and pr.season = :season
+                    )
                     union
-                    select player_id, team_id from predicted_lineups pl
-                    join matches m on m.id = pl.match_id where m.season = :season
-                ) seen
-                join players p on p.id = seen.player_id
-                join teams t on t.id = seen.team_id
-                where not exists (
-                    select 1 from player_ratings pr
-                    where pr.player_id = seen.player_id and pr.team_id = seen.team_id and pr.season = :season
-                )
-                order by t.code, p.fbref_name
+                    select p.id, p.fbref_name, t.id, t.code
+                    from predicted_lineups pl
+                    join matches m on m.id = pl.match_id
+                    join players p on p.id = pl.player_id
+                    join teams t on t.id = pl.team_id
+                    left join rating_release_dates rrd on rrd.season = m.season
+                    left join lateral (
+                        select x.rating_p, x.rating_a
+                        from player_ratings x
+                        where x.player_id = pl.player_id and x.season = m.season
+                          and (x.team_id = pl.team_id or x.team_id is null)
+                        order by (x.team_id = pl.team_id) desc, x.effective_date desc
+                        limit 1
+                    ) pr on true
+                    where m.season = :season and m.status = 'scheduled' and pl.predicted_status in (1, 2)
+                      and (case when rrd.release_date is not null and m.match_date >= rrd.release_date
+                                then pr.rating_a else pr.rating_p end) is null
+                ) u
+                order by team_code, fbref_name
             """),
             {"season": SEASON},
         ).fetchall()
     return rows
+
+
+def get_existing_row(engine, player_id, team_id):
+    """The (player, team, season) row already on file, if any: (rating_l, rating_a, age, position). Present for
+    kind (2) above -- a row that was created (e.g. before the EA FC release) but never got a usable rating_a."""
+    with engine.connect() as conn:
+        return conn.execute(
+            text("""
+                select rating_l, rating_a, age, position
+                from player_ratings
+                where player_id = :player_id and team_id = :team_id and season = :season
+            """),
+            {"player_id": player_id, "team_id": team_id, "season": SEASON},
+        ).fetchone()
 
 
 def get_most_recent_rating(engine, player_id):
@@ -174,11 +220,20 @@ if __name__ == "__main__":
     with engine.begin() as conn:
         for player_id, name, team_id, team_code in missing:
             prior = get_most_recent_rating(engine, player_id)
+            existing = get_existing_row(engine, player_id, team_id)
             if prior:
                 prior_rating_a, prior_season, prior_team_id, prior_age, prior_position = prior
                 note = " (new club)" if prior_team_id != team_id else ""
                 print(f"{name} ({team_code.upper()}) -- last rated {prior_rating_a:.1f} in season {prior_season}{note}")
                 suggested_l = prior_rating_a  # rating_l = last known rating_a, per project convention
+            elif existing and existing[0] is not None:
+                # Row already on file with a rating_l but no usable rating_a: a known player, not a new one, so
+                # skip the "is this a known player under a different name?" search and just fill rating_a.
+                print(f"{name} ({team_code.upper()}) -- row on file (rating_l {existing[0]}) but rating_a is missing, "
+                      f"so the model is currently skipping this player in the lineup averages")
+                suggested_l = existing[0]
+                prior_age = existing[2]
+                prior_position = existing[3]
             else:
                 print(f"{name} ({team_code.upper()}) -- no prior rating found, likely genuinely new to the model")
                 search = input("    Is this actually a known player under a different name? "

@@ -215,14 +215,38 @@ def get_missing_xg_count(engine):
     return row[0]
 
 
+# Shared by every "is this player's rating usable?" check below. Mirrors v_team_lineup_ratings_predicted EXACTLY: same
+# lateral pick of the player_ratings row (this team's row first, newest effective_date), same rating_release_dates
+# switch between rating_a (match on/after the season's EA FC release) and rating_p (before it). Keeping the check
+# in lockstep with the view means it can never disagree with what the model actually averaged. Needed because a
+# player_ratings row can EXIST while the rating the model uses is still NULL (e.g. a pre-release row created from
+# rating_l/rating_p that the EA FC import never filled in rating_a for); avg() then silently drops that player.
+# The checks that only asked "does a row exist?" missed exactly that case.
+_EFFECTIVE_RATING_JOIN = """
+    left join rating_release_dates rrd on rrd.season = m.season
+    left join lateral (
+        select x.rating_p, x.rating_a
+        from player_ratings x
+        where x.player_id = pl.player_id and x.season = m.season
+          and (x.team_id = pl.team_id or x.team_id is null)
+        order by (x.team_id = pl.team_id) desc, x.effective_date desc
+        limit 1
+    ) pr on true
+"""
+_EFFECTIVE_RATING_IS_NULL = (
+    "(case when rrd.release_date is not null and m.match_date >= rrd.release_date "
+    "then pr.rating_a else pr.rating_p end) is null"
+)
+
+
 def get_missing_ratings_count(engine):
-    """Same query as add_player_ratings.py's get_missing_ratings, just a
-    count for the warning banner -- same reasoning as the xG one, this
-    has to stay an interactive local script, not something a scheduled
-    job can run on its own."""
+    """Same two kinds of player as add_player_ratings.py's get_missing_ratings, just a count for the warning
+    banner -- same reasoning as the xG one, this has to stay an interactive local script, not something a
+    scheduled job can run on its own. (1) no player_ratings row at all for (player, team, season); (2) a row
+    exists, but the rating the model uses for an upcoming match (starter OR bench) is NULL."""
     with engine.connect() as conn:
         row = conn.execute(
-            text("""
+            text(f"""
                 select count(*) from (
                     select distinct player_id, team_id from (
                         select player_id, team_id from player_match_appearances pma
@@ -235,6 +259,13 @@ def get_missing_ratings_count(engine):
                         select 1 from player_ratings pr
                         where pr.player_id = seen.player_id and pr.team_id = seen.team_id and pr.season = :season
                     )
+                    union
+                    select pl.player_id, pl.team_id
+                    from predicted_lineups pl
+                    join matches m on m.id = pl.match_id
+                    {_EFFECTIVE_RATING_JOIN}
+                    where m.season = :season and m.status = 'scheduled' and pl.predicted_status in (1, 2)
+                      and {_EFFECTIVE_RATING_IS_NULL}
                 ) x
             """),
             {"season": SEASON},
@@ -289,31 +320,37 @@ def get_starter_counts(engine, season):
     return {(r[0], r[1]): r[2] for r in rows}
 
 
-def get_starters_missing_ratings(engine, season):
+def get_lineup_missing_ratings(engine, season):
     """A genuinely different problem from a bad headcount: a team can show
     exactly 11 posted starters (headcount check passes clean) while some
-    of those specific players still have no player_ratings row for this
-    team/season -- they silently drop out of the starters_rating average
-    (avg() just skips nulls) rather than causing any visible error. This
-    surfaced for real: three summer-import duplicate-name players had a
-    posted lineup land on the wrong player_id before being merged --
-    exactly the kind of thing this check exists to catch before it
-    affects a live prediction."""
+    of those specific players have no USABLE rating -- either no
+    player_ratings row for this team/season, or a row whose rating for the
+    match date (rating_a on/after the EA FC release, rating_p before it) is
+    NULL. They silently drop out of the starters_rating / bench_rating
+    average (avg() just skips nulls) rather than causing any visible error.
+    Covers the bench as well as the starters (bertD uses the bench average).
+
+    Returns {(match_id, team_id): {"starters": [names], "bench": [names]}}
+    for every team-match with at least one such player."""
     with engine.connect() as conn:
         rows = conn.execute(
-            text("""
-                select pl.match_id, pl.team_id, count(*) as missing_count
+            text(f"""
+                select pl.match_id, pl.team_id, pl.predicted_status, p.fbref_name
                 from predicted_lineups pl
-                where pl.predicted_status = 2
-                  and not exists (
-                      select 1 from player_ratings pr
-                      where pr.player_id = pl.player_id and pr.team_id = pl.team_id and pr.season = :season
-                  )
-                group by pl.match_id, pl.team_id
+                join matches m on m.id = pl.match_id
+                join players p on p.id = pl.player_id
+                {_EFFECTIVE_RATING_JOIN}
+                where m.season = :season and pl.predicted_status in (1, 2)
+                  and {_EFFECTIVE_RATING_IS_NULL}
+                order by pl.match_id, pl.team_id, pl.predicted_status desc, p.fbref_name
             """),
             {"season": season},
         ).fetchall()
-    return {(r[0], r[1]): r[2] for r in rows}
+    out = {}
+    for match_id, team_id, status, name in rows:
+        entry = out.setdefault((match_id, team_id), {"starters": [], "bench": []})
+        entry["starters" if status == 2 else "bench"].append(name.title())
+    return out
 
 
 def lineup_check_message(starter_counts, missing_ratings, match_id, team_id):
@@ -323,9 +360,13 @@ def lineup_check_message(starter_counts, missing_ratings, match_id, team_id):
     messages = []
     if count != 11:
         messages.append(f"{count} starters posted (expected 11)")
-    missing = missing_ratings.get((match_id, team_id), 0)
-    if missing > 0:
-        messages.append(f"{missing} starter{'s' if missing != 1 else ''} missing a {SEASON} rating")
+    missing = missing_ratings.get((match_id, team_id))
+    if missing:
+        for label, key in (("starter", "starters"), ("bench player", "bench")):
+            names = missing[key]
+            if names:
+                messages.append(f"{len(names)} {label}{'s' if len(names) != 1 else ''} "
+                                f"missing a {SEASON} rating ({', '.join(names)})")
     return "; ".join(messages)
 
 
@@ -1208,7 +1249,8 @@ BET_BADGE_COLOR = {"bet": "#1a7f37", "pass": "#666", "too_early": "#999",
 
 
 def lineup_check_cell(msg):
-    """Empty message means 11 starters posted and every starter has a rating; otherwise show what's wrong."""
+    """Empty message means 11 starters posted and every starter and bench player has a usable rating; otherwise
+    show what's wrong."""
     if not msg:
         return "<td style=\"color:#1a7f37;\">11/11</td>"
     if msg == "No lineup posted yet":
@@ -1573,7 +1615,7 @@ if __name__ == "__main__":
     print(f"Found {len(matches)} candidate matches (next matchweek, today, or a posted lineup).")
 
     starter_counts = get_starter_counts(engine, SEASON)
-    starters_missing_ratings = get_starters_missing_ratings(engine, SEASON)
+    lineup_missing_ratings = get_lineup_missing_ratings(engine, SEASON)
 
     upcoming = []
     with engine.begin() as conn:
@@ -1598,7 +1640,7 @@ if __name__ == "__main__":
                 evaluation = evaluate_side(model_prob, ml, line_type, bankroll, edge_threshold, games_played)
                 evaluation.update({
                     "match_date": match_date, "team_code": team_code, "is_home": is_home,
-                    "lineup_check": lineup_check_message(starter_counts, starters_missing_ratings, match_id, team_id),
+                    "lineup_check": lineup_check_message(starter_counts, lineup_missing_ratings, match_id, team_id),
                 })
                 game["home" if is_home else "away"] = evaluation
 
